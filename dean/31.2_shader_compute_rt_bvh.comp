@@ -1,0 +1,590 @@
+#version 450
+
+#define MAX_BOUNCE     5
+
+#define LAMBERTIAN     0
+#define METAL          1
+#define DIELECTRIC     2
+
+#define PI 			   3.1415926535
+
+// debug key
+#define USE_BVH        (1 << 0)
+#define SHADER_RANDOM  (1 << 1)
+
+struct PackedBVHNode {
+    vec4 aabbMin;  // xyz: min, w: left
+    vec4 aabbMax;  // xyz: max, w: right
+    ivec4 meta;    // x: primitiveOffset, y: primitiveCount
+};
+
+// todo, rename to packedXX ?
+struct PackedSphere {
+    vec3 center;
+    float radius;
+
+    // material
+    vec3 color;
+    int materialType; // LAMBERTIAN, METAL, DIELECTRIC
+
+    float fuzz;
+    float refractionIndex;
+    float pad1;
+    float pad2;
+};
+
+layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+layout(std140, binding = 0) uniform UBO {
+    vec3 cameraPosition;
+    float currentTime;
+    vec3 cameraFront; // normalized
+    float sphereCount;
+    vec3 cameraUp; // normalized
+    int debugKey;
+    vec3 cameraRight; // normalized
+    float pad4;
+} ubo;
+
+layout(binding = 1, rgba32f) uniform writeonly image2D imgOutput;
+
+layout(std430, binding = 2) readonly buffer PackedSpheres {
+    PackedSphere spheresSSBO[];
+};
+
+layout(std430, binding = 3) readonly buffer Primitives {
+    int primitivesSSBO[];
+};
+
+layout(std430, binding = 4) readonly buffer BVHNodes {
+    PackedBVHNode bvhNodesSSBO[];
+};
+
+// image size已知, 由下面三个信息可以知道image里面任意pixel的世界坐标.
+struct Screen {
+    vec3 pixel00Location; // the world space location of first pixel in screen
+    vec3 pixelDeltaU; // 从camera看向screen, image width 方向从左到右, 一个pixel的向量大小
+    vec3 pixelDeltaV; // 从camera看向screen, image height方向从上到下, 一个pixel的向量大小
+};
+
+// todo, reorder the members in struct.
+struct Ray {
+    vec3 origin;
+    vec3 direction; // normalized
+};
+
+struct HitInfo {
+    // surface properties
+    float t;        // distance along the ray
+    vec3 p;         // hit point
+    vec3 normal;    // hit point normal, normalized
+
+    // material properties
+    vec3 color;       // hit point color
+    int materialType; // LAMBERTIAN, METAL, DIELECTRIC
+    bool hit;       // hit or not.
+};
+
+// tube = cylinder, 两头是球, 画出来更像是一个capsule
+struct Line {
+    vec3 a;
+    vec3 b;
+    float radius;
+    vec3 color;
+};
+
+vec3 skyColor(vec3 rd) {
+    vec3 unit_rd = normalize(rd); // just in case the rd is not normalized.
+    // y分量是[-1, 1], 变为[0, 1]
+    float a = 0.5 * (unit_rd.y + 1.0);
+    // 给一个天空的颜色.
+    return mix(vec3(1.0, 1.0, 1.0), vec3(0.5, 0.7, 1.0), a);
+}
+
+// return true - hit到了sphere, 同时这个hit点是最近的.
+// point is also a small sphere.
+bool hitSphere(Ray ray, PackedSphere sphere, inout HitInfo hit) {
+    // 一元二次方程求解, 按数学公式的写法
+#if 0
+    float a = dot(ray.direction, ray.direction); 
+    vec3 co = ray.origin - sphere.center;
+    float b = 2.0 * dot(ray.direction, co);
+    float c = dot(co, co) - sphere.radius * sphere.radius;
+    float discriminant = b * b - 4.0 * a * c;
+    if (discriminant < 0.) {
+        return false;
+    }
+    // 还没有算t
+    return discriminant > 0;
+#endif
+    // 改进,
+    //   dir是normalized, a=1
+    //   b里面有个2, 平方后为4, -4ac也有4, 开根号为2, 分母为2a, 正好可以把2去掉
+    vec3 co = ray.origin - sphere.center; // 向量co
+    float b = dot(co, ray.direction);
+    float c = dot(co, co) - sphere.radius * sphere.radius;
+    float h = b*b - c;
+    // 无解, 没有hit
+    if (h < 0.0) {
+        return false;
+    }
+    h = sqrt(h);
+    // 有解, t=-b-h和-b+h, 两个float, 取近的先
+    float t = -b - h;
+    // 负数说明hit在camera/ray的后面
+    if (t < 0.0) {
+        t = -b + h;
+    }
+
+    if (t >= 0.0 && t < hit.t) {
+        hit.t = t;
+        hit.p = ray.origin + t * ray.direction;
+        hit.normal = normalize(hit.p - sphere.center);
+        hit.color = sphere.color;
+        hit.materialType = sphere.materialType;
+        return true;
+    }
+    return false;
+}
+
+// 公式还没看, 以后再理解.
+bool hitLineSegment(Ray ray, Line line, inout HitInfo hit) {
+    vec3 u = ray.direction;
+    vec3 v = line.b - line.a;
+    vec3 w0 = ray.origin - line.a;
+
+    // These are dot product values used in the system of equations to find the parameters sc and tc, which tell us:
+    // sc: where along the ray the closest point lies, this is the t.
+    // tc: where along the segment the closest point lies
+    float a = dot(u, u);
+    float b = dot(u, v);
+    float c = dot(v, v);
+    float d = dot(u, w0);
+    float e = dot(v, w0);
+
+    float denom = a * c - b * b;
+    if (abs(denom) < 1e-5) {
+        return false; // Ray and segment are nearly parallel
+    }
+
+    float sc = (b * e - c * d) / denom;
+    float tc = (a * e - b * d) / denom;
+
+    // Only allow within segment, clamp tc to [0, 1] for segment endpoints
+    tc = clamp(tc, 0.0, 1.0);
+
+    vec3 closestRay = ray.origin + sc * u;
+    vec3 closestSeg = line.a + tc * v;
+
+    float dist = length(closestRay - closestSeg);
+    // If the distance is greater than the tube's radius, no hit.
+    // If sc < 0.0, it means the intersection is behind the ray origin — we discard that.
+    // If other obj is closer than current one, discard.
+    if (dist > line.radius || sc < 0.0 || sc >= hit.t) {
+        return false;
+    }
+
+    // Update hit info.
+    hit.t = sc;
+    hit.p = closestRay;
+    hit.normal = normalize(closestRay - closestSeg);
+    hit.color = line.color;
+    return true;
+}
+
+void drawAxes(Ray ray, inout HitInfo hit) {
+    // +X axis: red
+    Line x = {
+        vec3(0.0, 0.0, 0.0), vec3(5.0, 0.0, 0.0), 0.01, vec3(1.0, 0.0, 0.0)
+    };
+    hitLineSegment(ray, x, hit);
+
+    // +Y axis: green
+    Line y = {
+        vec3(0.0, 0.0, 0.0), vec3(0.0, 5.0, 0.0), 0.01, vec3(0.0, 1.0, 0.0)
+    };
+    hitLineSegment(ray, y, hit);
+
+    // +Z axis: red
+    Line z = {
+        vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 5.0), 0.01, vec3(0.0, 0.0, 1.0)
+    };
+    hitLineSegment(ray, z, hit);
+}
+
+// 不需要update hit info. 这是虚拟的aabb不是真实的物体.
+bool hitAABB(vec3 ro, vec3 invD, vec3 aabbMin, vec3 aabbMax) {
+    vec3 t0 = (aabbMin - ro) * invD;
+    vec3 t1 = (aabbMax - ro) * invD;
+    // 每一个分量独立比较, 把每个轴上小的放到tmin, 大的放到tmax
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    // 在小的里面找最大的
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    // 大的里面找最小的
+    float tFar = min(min(tmax.x, tmax.y), tmax.z);
+    return (tFar >= tNear && tFar >= 0.0);
+}
+
+void traverseBVH(Ray ray, inout HitInfo hit) {
+    bool hitObj = false;
+
+    if ((ubo.debugKey & USE_BVH) == 0) {
+        // O(n)
+        // 故意少一个.
+        for (int i=0; i < ubo.sphereCount - 1; ++i) {
+            if (hitSphere(ray, spheresSSBO[i], hit)) {
+                hitObj = true;
+            }
+        }
+        if (!hitObj) {
+            hit.color = skyColor(ray.direction);
+        }
+        return;
+    }
+
+    // O(logn)
+    vec3 invDir = 1.0 / ray.direction;
+    const int maxStackSize = 64;
+    int stack[maxStackSize];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0;  // root node index = 0
+
+    while (stackPtr > 0) {
+        int nodeIdx = stack[--stackPtr];
+        PackedBVHNode node = bvhNodesSSBO[nodeIdx];
+
+        if (!hitAABB(ray.origin, invDir, node.aabbMin.xyz, node.aabbMax.xyz)) {
+            continue;
+        }
+
+        // primitiveCount > 0
+        if (node.meta.y > 0) {
+            // 叶子节点
+            for (int i = 0; i < node.meta.y; ++i) {
+                int primIdx = primitivesSSBO[node.meta.x + i];
+                // 这里不能hit就return, 可能hit多个, 取最近的那个
+                if (hitSphere(ray, spheresSSBO[primIdx], hit)) {
+                    hitObj = true;
+                }
+            }
+            // 这里也不能hit到obj就return, 在当前的叶子hit到了, 在其他的叶子可能还会hit到, 而且距离camera更近.
+            // if (hitObj) {
+            //     return;
+            // }
+        } else {
+            // 内部节点，push children
+            if (stackPtr + 2 <= maxStackSize) {
+                stack[stackPtr++] = int(node.aabbMin.w); // left child
+                stack[stackPtr++] = int(node.aabbMax.w); // right child
+            }
+        }
+    }
+
+    if (!hitObj) {
+        hit.color = skyColor(ray.direction);
+    }
+}
+
+// fov is degree
+// viewport是由fov和CameraScreenDistance决定的, 然后把整个image塞满这个viewport.
+// todo, 这个是一次性的, 一般不变, 放到cpu做, ubo传进来?
+void initScreen(out Screen screen, float fov, ivec2 imgSz, float CameraScreenDistance) {
+    const float aspect = float(imgSz.x) / float(imgSz.y);
+
+    // 这里根据张开眼睛的大小(FOV)和camera到image的距离等个信息, 得到viewport的大小
+    float theta = fov * PI / 180.0;
+    // 由fov得到h, CameraScreenDistance=camear和image的距离=10
+    float tanHalfTheta = tan(theta / 2.0);
+    float viewportHeight = 2 * tanHalfTheta * CameraScreenDistance;
+    float viewportWidth = viewportHeight * aspect;
+
+    // viewport的width和camera right是平行的, 相乘代表viewport的u向量, 从左到右.
+    vec3 viewportU = viewportWidth * ubo.cameraRight;
+    // 同理, viewport的v向量, 注意这里用的是-cameraUp, 代表从上到下.
+    vec3 viewportV = viewportHeight * -ubo.cameraUp;
+
+    // 除以image_width代表一个pixel (pixel中心到下一个pixel中心)的向量.
+    screen.pixelDeltaU = viewportU / imgSz.x;
+    screen.pixelDeltaV = viewportV / imgSz.y;
+
+    // 从camera的位置center开始, 向cameraFront方向走CameraScreenDistance距离,  到了viewport的中心, 然后走到viewport的左上角.
+    vec3 viewportUpperLeft = ubo.cameraPosition + (CameraScreenDistance * ubo.cameraFront) - viewportU/2 - viewportV/2;
+    // 每个pixel不是一个点, 而是一个1x1的quad, pixel的中心在(0.5, 0.5)
+    screen.pixel00Location = viewportUpperLeft + 0.5 * (screen.pixelDeltaU + screen.pixelDeltaV);
+}
+
+// pixelCoord, 范围[0, imageWidth-1] 和 [0, imageHeight-1]
+Ray getRay(Screen screen, ivec2 pixelCoord) {
+    // 如果一个pixel只有一个ray的话, 可以直接用pixel的中心, 但是这里可能是multisample,
+    // 所以以pixel center (-0.5, 0.5)为中心, 1x1 quad内随机取一点
+    //auto offset = sample_square();
+    const vec2 offset = vec2(0.0f); // 假设一个pixel只有一个sample, 在square正中间.
+    vec3 pixel_sample = screen.pixel00Location
+    + ((pixelCoord.x + offset.x) * screen.pixelDeltaU)
+    + ((pixelCoord.y + offset.y) * screen.pixelDeltaV);
+
+    vec3 rd = normalize(pixel_sample - ubo.cameraPosition);
+
+    return Ray(ubo.cameraPosition, rd);
+}
+
+// seed.xy 是任意的 vec2, 可以传入 [0,1] 的 uv 坐标，也可以是更大的整数坐标（如 vec2(34.0, 92.0)）;
+// 输出结果在 [0, 1) 区间
+float random(vec2 seed) {
+    return fract(sin(dot(seed.xy, vec2(12.9898, 78.233))) * 43758.5453123);
+}
+
+vec2 randSeed;
+float random() {
+    randSeed += vec2(1.0, 1.0);  // 推进种子
+#if 0
+    // 引入时间就变成了non-deterministic 
+    float rnd = random(ubo.currentTime * randSeed);
+#else
+    float rnd = random(randSeed);
+    randSeed = vec2(rnd);
+#endif
+    return rnd;
+}
+
+// 半球内随机单位向量
+vec3 random_in_unit_sphere() {
+    vec3 p;
+    do {
+        // random()返回的是[0, 1], 转成[-1, 1]
+        p = 2.0 * vec3(random(), random(), random()) - vec3(1.0);
+    } while (dot(p, p) >= 1.0);
+    return p;
+}
+
+vec3 random_in_unit_sphere_2() {
+    float phi = 2.0 * PI * random();
+    float cosTheta = 2.0 * random() - 1.0;
+    float u = random();
+
+    float theta = acos(cosTheta);
+    float r = pow(u, 1.0 / 3.0);
+
+    float x = r * sin(theta) * cos(phi);
+    float y = r * sin(theta) * sin(phi);
+    float z = r * cos(theta);
+
+    return vec3(x, y, z);
+}
+
+void traverseBVH2(Ray ray, inout HitInfo hit) {
+    if ((ubo.debugKey & USE_BVH) == 0) {
+        // O(n)
+        // 故意少一个.
+        for (int i=0; i < ubo.sphereCount - 1; ++i) {
+            if (hitSphere(ray, spheresSSBO[i], hit)) {
+                hit.hit = true;
+            }
+        }
+        return;
+    }
+
+    // O(logn)
+    vec3 invDir = 1.0 / ray.direction;
+    const int maxStackSize = 64;
+    int stack[maxStackSize];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0;  // root node index = 0
+
+    while (stackPtr > 0) {
+        int nodeIdx = stack[--stackPtr];
+        PackedBVHNode node = bvhNodesSSBO[nodeIdx];
+
+        if (!hitAABB(ray.origin, invDir, node.aabbMin.xyz, node.aabbMax.xyz)) {
+            continue;
+        }
+
+        // primitiveCount > 0
+        if (node.meta.y > 0) {
+            // 叶子节点
+            for (int i = 0; i < node.meta.y; ++i) {
+                int primIdx = primitivesSSBO[node.meta.x + i];
+                // 这里不能hit就return, 可能hit多个, 取最近的那个
+                if (hitSphere(ray, spheresSSBO[primIdx], hit)) {
+                    hit.hit = true;
+                }
+            }
+            // 这里也不能hit到obj就return, 在当前的叶子hit到了, 在其他的叶子可能还会hit到, 而且距离camera更近.
+            // if (hitObj) {
+            //     return;
+            // }
+        } else {
+            // 内部节点，push children
+            if (stackPtr + 2 <= maxStackSize) {
+                stack[stackPtr++] = int(node.aabbMin.w); // left child
+                stack[stackPtr++] = int(node.aabbMax.w); // right child
+            }
+        }
+    }
+}
+
+// 返回值 - 是否发生了散射. 如果返回 false, 说明射线被吸收, 直接终止.
+// scattered - 表示材质反射或折射后生成的新光线, 用于继续追踪(即 next bounce)
+// attenuation - 光线能量的衰减因子(颜色滤波器), 表示通过该材质后, 颜色的乘法因子.
+// 例如(1,1,1) 表示不变, (0.8, 0.8, 0.8) 表示略微变暗.
+bool scatter(Ray rayIn, HitInfo hit, out Ray scattered, out vec3 attenuation) {
+    if (hit.materialType == LAMBERTIAN) {
+        // 漫反射
+        //vec3 target = hit.p + hit.normal + normalize(random_in_unit_sphere());
+        vec3 target = hit.p + hit.normal;
+        if ((ubo.debugKey & SHADER_RANDOM) != 0) {
+            target += normalize(random_in_unit_sphere());
+            //return true;
+        }
+
+        scattered.origin = hit.p;
+        scattered.direction = normalize(target - hit.p);
+        //scattered.direction = hit.normal; // debug
+        attenuation = hit.color;
+        return true;
+    } else if (hit.materialType == METAL) {
+        // 镜面反射 + 模糊
+        vec3 reflected = reflect(normalize(rayIn.direction), hit.normal);
+        scattered.origin = hit.p;
+        //scattered.direction = normalize(reflected + hit.fuzz * random_in_unit_sphere());
+        scattered.direction = normalize(reflected);
+        attenuation = hit.color;
+
+        // 金属表面若散射角度过大就吸收
+        return (dot(scattered.direction, hit.normal) > 0.0);
+    } else if (hit.materialType == DIELECTRIC) {
+        // 折射或反射
+        // attenuation = vec3(1.0); // 玻璃不吸收光
+
+        // vec3 outwardNormal;
+        // vec3 reflected = reflect(rayIn.direction, hit.normal);
+        // float ni_over_nt;
+        // float cosine;
+
+        // if (dot(rayIn.direction, hit.normal) > 0.0) {
+        //     // 从玻璃出来
+        //     outwardNormal = -hit.normal;
+        //     ni_over_nt = hit.refraction_index;
+        //     cosine = hit.refraction_index * dot(rayIn.direction, hit.normal) / length(rayIn.direction);
+        // } else {
+        //     // 从空气进入玻璃
+        //     outwardNormal = hit.normal;
+        //     ni_over_nt = 1.0 / hit.refraction_index;
+        //     cosine = -dot(rayIn.direction, hit.normal) / length(rayIn.direction);
+        // }
+
+        // vec3 refracted;
+        // float reflectProb;
+        // if (refract(rayIn.direction, outwardNormal, ni_over_nt, refracted)) {
+        //     reflectProb = schlick(cosine, hit.refraction_index);
+        // } else {
+        //     // 全反射
+        //     reflectProb = 1.0;
+        // }
+
+        // if (rand() < reflectProb) {
+        //     scattered.origin = hit.position;
+        //     scattered.direction = normalize(reflected);
+        // } else {
+        //     scattered.origin = hit.position;
+        //     scattered.direction = normalize(refracted);
+        // }
+
+        return false; // todo, check?
+    }
+
+    return false;
+}
+
+// bounce多次, 返回最终的颜色
+vec3 rayTrace(Ray ray) {
+    vec3 pixel = vec3(1.0);
+    //vec3 throughput = vec3(1.0);
+
+    for (int i = 0; i < MAX_BOUNCE; ++i) {
+        HitInfo hit;
+        hit.t = 1e30;
+        hit.hit = false;
+
+        traverseBVH2(ray, hit);
+
+        if (!hit.hit) {
+            pixel *= skyColor(ray.direction);
+            break;
+        }
+
+        // 累加光源发射光（可选）
+        // if (hit.material == EMISSIVE) {
+        //     pixel += throughput * hit.emission;
+        //     break;
+        // }
+
+        Ray scattered;
+        vec3 attenuation;
+
+        if (!scatter(ray, hit, scattered, attenuation)) {
+            break;
+        }
+
+        //throughput *= attenuation;
+        ray = scattered;
+        pixel *= attenuation;
+    }
+
+    return pixel;
+}
+
+void main() {
+    // 确保WG number和WG size相乘正好是texture的pixel个数, 一个pixel一个invocation.
+    // ogl的线程从左下开始, vk的从左上开始.
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imgSz = imageSize(imgOutput);
+    // 如果invocation超过了image size, 不用做.
+    if (any(greaterThanEqual(pixelCoord, imgSz))) {
+        return;
+    }
+
+    // 用每个pixel中心的坐标当作初始seed, e.g. (0, 0)对应的坐标为(0.5, 0.5).
+    // 要调用random()多次, (0, 0)做种子的话后面全部是0.
+    randSeed = (pixelCoord * 1.0 + 0.5)/ imgSz;
+
+#if 0
+    vec2 coeff = (pixelCoord * 2. - imgSz) / imgSz; // map to [-1, 1]
+    coeff.y = -coeff.y;
+    //vec2 uv = (gl_GlobalInvocationID.xy / imgSz.xy) * 2.0 - 1.0; //一样, 似乎这样用的多.
+
+    // 由coeff为[-1, 1]可知,
+    // 如果是image中间点, rd = camera.front + 0 + 0
+    // 如果是中间点的最左边, rd = camera.front + -1 * camera.right + 0
+    // 如果是中间点的最右边, rd = camera.front +  1 * camera.right + 0
+    // 线上的其他点就是均分, 或者插值.
+    // y方向上的同理.
+    Ray ray = {
+        ubo.cameraPosition,                                            // origin
+        normalize(ubo.cameraFront + coeff.x * ubo.cameraRight + coeff.y * ubo.cameraUp)    // direction.
+    };
+#else
+    Screen screen;
+    const float CameraScreenDistance = 10.0f;
+    const float fov = 20.2f;
+    initScreen(screen, fov, imgSz, CameraScreenDistance);
+    Ray ray = getRay(screen, pixelCoord);
+#endif
+
+#if 0
+    // 可能会hit到多个obj, 取t最短的那个
+    HitInfo hit;
+    hit.t = 1e20;
+    hit.color = vec3(0.0);
+
+    traverseBVH(ray, hit);
+
+    drawAxes(ray, hit);
+
+    imageStore(imgOutput, pixelCoord, vec4(hit.color,1.0));
+#else
+    vec3 pixel = rayTrace(ray);              
+    imageStore(imgOutput, pixelCoord, vec4(pixel, 1.0));
+#endif
+}
