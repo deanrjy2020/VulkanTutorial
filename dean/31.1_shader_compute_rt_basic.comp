@@ -1,0 +1,399 @@
+#version 450
+layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+layout(std140, binding = 0) uniform CameraUBO {
+    vec3 position;
+    float deltaTime; // no use
+    vec3 front;
+    float pad2;
+    vec3 up;
+    float pad3;
+    vec3 right;
+    float pad4;
+} camera;
+
+layout(binding = 1, rgba32f) uniform writeonly image2D imgOutput;
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct HitInfo {
+    float t;        // distance along the ray
+    vec3 p;         // hit point
+    vec3 normal;    // surface normal
+    int type;       // 0 = none, 1 = point, 2 = line, 3 = triangle, 4 = plane, 5 = sphere, ...
+};
+
+struct Plane {
+    vec3 p0;        // point in the plane, center if disk.
+    vec3 normal;
+    float radius;   // for disk
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+};
+
+// tube = cylinder, 两头是球, 画出来更像是一个capsule
+struct Line {
+    vec3 a;
+    vec3 b;
+    float radius;
+};
+
+// AABB box
+struct Box {
+    vec3 minB;
+    vec3 maxB;
+};
+
+struct Triangle {
+    vec3 v0, v1, v2;
+    vec2 uv0, uv1, uv2;  // UVs at each vertex
+};
+
+// return true - HitInfo updated (hit and obj is the closest one)
+bool hitPlane(Ray ray, Plane plane, inout HitInfo hit) {
+    float denom = dot(ray.direction, plane.normal);
+    // ray和plane平行
+    if (abs(denom) < 1e-6) {
+        return false;
+    }
+    float t = dot(plane.p0 - ray.origin, plane.normal) / denom;
+    if (t >= 0.0 && t < hit.t) {
+        hit.t = t;
+        hit.p = ray.origin + t * ray.direction;
+        hit.normal = plane.normal;
+        hit.type = 4;
+        return true;
+    }
+    return false;
+}
+
+// Disk intersection
+// 和hitPlane()一样的思路, 因为在里面update了HitInfo, 不能直接调用hitPlane
+bool hitDisk(Ray ray, Plane disk, inout HitInfo hit) {
+    float denom = dot(ray.direction, disk.normal);
+    // ray和plane平行
+    if (abs(denom) < 1e-6) {
+        return false;
+    }
+    float t = dot(disk.p0 - ray.origin, disk.normal) / denom;
+    if (t >= 0.0 && t < hit.t &&
+        // check if the hit point is in range.
+        length(ray.origin + t * ray.direction - disk.p0) <= disk.radius) {
+        hit.t = t;
+        hit.p = ray.origin + t * ray.direction;
+        hit.normal = disk.normal;
+        hit.type = 4;
+        return true;
+    }
+    return false;
+}
+
+// point is also a small sphere.
+bool hitSphere(Ray ray, Sphere sphere, inout HitInfo hit) {
+    // 一元二次方程求解, 按数学公式的写法
+#if 0
+    float a = dot(ray.direction, ray.direction); 
+    vec3 co = ray.origin - sphere.center;
+    float b = 2.0 * dot(ray.direction, co);
+    float c = dot(co, co) - sphere.radius * sphere.radius;
+    float discriminant = b * b - 4.0 * a * c;
+    if (discriminant < 0.) {
+        return false;
+    }
+    // 还没有算t
+    return discriminant > 0;
+#endif
+    // 改进,
+    //   dir是normalized, a=1
+    //   b里面有个2, 平方后为4, -4ac也有4, 开根号为2, 分母为2a, 正好可以把2去掉
+    vec3 co = ray.origin - sphere.center; // 向量co
+    float b = dot(co, ray.direction);
+    float c = dot(co, co) - sphere.radius * sphere.radius;
+    float h = b*b - c;
+    // 无解, 没有hit
+    if (h < 0.0) {
+        return false;
+    }
+    h = sqrt(h);
+    // 有解, t=-b-h和-b+h, 两个float, 取近的先
+    float t = -b - h;
+    // 负数说明hit在camera/ray的后面
+    if (t < 0.0) {
+        t = -b + h;
+    }
+
+    if (t >= 0.0 && t < hit.t) {
+        hit.t = t;
+        hit.p = ray.origin + t * ray.direction;
+        hit.normal = normalize(hit.p - sphere.center);
+        hit.type = 5;
+        return true;
+    }
+    return false;
+}
+
+// 公式还没看, 以后再理解.
+bool hitLineSegment(Ray ray, Line line, inout HitInfo hit) {
+    vec3 u = ray.direction;
+    vec3 v = line.b - line.a;
+    vec3 w0 = ray.origin - line.a;
+
+    // These are dot product values used in the system of equations to find the parameters sc and tc, which tell us:
+    // sc: where along the ray the closest point lies, this is the t.
+    // tc: where along the segment the closest point lies
+    float a = dot(u, u);
+    float b = dot(u, v);
+    float c = dot(v, v);
+    float d = dot(u, w0);
+    float e = dot(v, w0);
+
+    float denom = a * c - b * b;
+    if (abs(denom) < 1e-5) {
+        return false; // Ray and segment are nearly parallel
+    }
+
+    float sc = (b * e - c * d) / denom;
+    float tc = (a * e - b * d) / denom;
+
+    // Only allow within segment, clamp tc to [0, 1] for segment endpoints
+    tc = clamp(tc, 0.0, 1.0);
+
+    vec3 closestRay = ray.origin + sc * u;
+    vec3 closestSeg = line.a + tc * v;
+
+    float dist = length(closestRay - closestSeg);
+    // If the distance is greater than the tube's radius, no hit.
+    // If sc < 0.0, it means the intersection is behind the ray origin — we discard that.
+    // If other obj is closer than current one, discard.
+    if (dist > line.radius || sc < 0.0 || sc >= hit.t) {
+        return false;
+    }
+
+    // Update hit info.
+    hit.t = sc;
+    hit.p = closestRay;
+    hit.normal = normalize(closestRay - closestSeg);
+    hit.type = 2;
+    return true;
+}
+
+// AABB box intersection
+// left, right, top, bottom, near, far 6个面组成了box, 对应6个float, 都在Box里面.
+// 对应6个t, 即x,y,z个有t_min和t_max
+// Box里面的minB不可能都是最小的, maxB也不可能都是最大的, 大小混合.
+bool hitBox(Ray ray, Box box, inout HitInfo hit) {
+    vec3 invD = 1.0 / ray.direction;
+    vec3 t0 = (box.minB - ray.origin) * invD;
+    vec3 t1 = (box.maxB - ray.origin) * invD;
+    // 每一个分量独立比较, 把每个轴上小的放到tmin, 大的放到tmax
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    // 在小的里面找最大的
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    // 大的里面找最小的
+    float tFar = min(min(tmax.x, tmax.y), tmax.z);
+    //t = tNear;
+    if (tFar >= tNear && tFar >= 0.0 && tNear < hit.t) {
+        hit.t = tNear;
+        hit.p = ray.origin + tNear * ray.direction;
+        // Epsilon to account for floating-point error
+        float eps = 0.0001;
+        // Determine which axis was hit
+        hit.normal = vec3(0.0); // set a default one.
+        if (abs(hit.p.x - min(box.minB.x, box.maxB.x)) < eps) hit.normal = vec3(-1, 0, 0);
+        if (abs(hit.p.x - max(box.minB.x, box.maxB.x)) < eps) hit.normal = vec3(1, 0, 0);
+        if (abs(hit.p.y - min(box.minB.y, box.maxB.y)) < eps) hit.normal = vec3(0, -1, 0);
+        if (abs(hit.p.y - max(box.minB.y, box.maxB.y)) < eps) hit.normal = vec3(0,  1, 0);
+        if (abs(hit.p.z - min(box.minB.z, box.maxB.z)) < eps) hit.normal = vec3(0, 0, -1);
+        if (abs(hit.p.z - max(box.minB.z, box.maxB.z)) < eps) hit.normal = vec3(0, 0,  1);
+        hit.type = 5;
+        return true;
+    }
+    return false;
+}
+
+// Triangle intersection (Möller–Trumbore)
+// 公式还没看, 以后再理解.
+bool hitTriangle(Ray ray, Triangle tri, inout HitInfo hit) {
+    // Compute the two edges sharing vertex v0
+    vec3 v0v1 = tri.v1 - tri.v0;
+    vec3 v0v2 = tri.v2 - tri.v0;
+
+    // Calculate the determinant (cross product of ray direction and v0v2)
+    vec3 pvec = cross(ray.direction, v0v2);
+    float det = dot(v0v1, pvec);
+
+    // If the determinant is near zero, the ray is parallel to the triangle plane
+    if (abs(det) < 1e-8) return false;
+
+    // Inverse determinant for later division
+    float invDet = 1.0 / det;
+
+    // Vector from v0 to ray origin
+    vec3 tvec = ray.origin - tri.v0;
+
+    // Compute U parameter and test bounds
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    // Prepare to test V parameter
+    vec3 qvec = cross(tvec, v0v1);
+
+    // Compute V parameter and test bounds
+    float v = dot(ray.direction, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    // Compute the distance (t) along the ray to the intersection point
+    float t = dot(v0v2, qvec) * invDet;
+
+    // Check if t is positive and closer than any previous hit
+    if (t > 0.0 && t < hit.t) {
+        // Update hit information
+        hit.t = t;  // Distance to hit point
+        hit.p = ray.origin + t * ray.direction; // Actual hit point in world space
+
+        // tow normals with diff directions, either way.
+        //hit.normal = normalize(-cross(v0v1, v0v2)); // Triangle normal (flat shading)
+        // store the color in normal
+        float w = 1.0 - u - v;  // Third barycentric coord besides u, v
+        vec2 uv = tri.uv0 * w + tri.uv1 * u + tri.uv2 * v;
+        //hit.normal = texture(brickTexture, uv).rgb;
+        hit.normal = vec3(1.0, 1.0, 0.0);
+
+        hit.type = 3; // Hit type: triangle
+        return true;
+    }
+
+    // No valid intersection found
+    return false;
+}
+
+void main() {
+    vec3 pixel = vec3(0.0);
+    // 确保WG number和WG size相乘正好是texture的pixel个数, 一个pixel一个invocation.
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(imgOutput);
+    // 如果invocation超过了image size, 不用做.
+    if (any(greaterThanEqual(pixelCoord, imageSize))) {
+        return;
+    }
+    vec2 coeff = (pixelCoord * 2. - imageSize) / imageSize; // map to [-1, 1]
+    coeff.y = -coeff.y; // ogl的线程从左下开始, vk的从左上开始.
+    //vec2 uv = (gl_GlobalInvocationID.xy / imageSize.xy) * 2.0 - 1.0; //一样, 似乎这样用的多.
+
+    // 由coeff为[-1, 1]可知,
+    // 如果是image中间点, rd = camera.front + 0 + 0
+    // 如果是中间点的最左边, rd = camera.front + -1 * camera.right + 0
+    // 如果是中间点的最右边, rd = camera.front +  1 * camera.right + 0
+    // 线上的其他点就是均分, 或者插值.
+    // y方向上的同理.
+    Ray ray = {
+        camera.position,                                            // origin
+        normalize(camera.front + coeff.x * camera.right + coeff.y * camera.up)    // direction.
+    };
+
+    // 可能会hit到多个obj, 取t最短的那个
+    HitInfo hit;
+    hit.t = 1e20;
+    hit.type = 0;
+
+    Plane plane = {
+        vec3(0.0, -1.0, 0.0), // p0
+        vec3(0.0,  1.0, 0.0), // normal
+        0.0                   // r
+    };
+    if (hitPlane(ray, plane, hit)) {
+        // Checker pattern
+        float checker = mod(floor(hit.p.x) + floor(hit.p.z), 2.0);
+        pixel = mix(vec3(0.3), vec3(0.7), checker);
+    }
+
+    Plane disk = {
+        vec3(2.5, -0.1, -3.0), // p0
+        vec3(0.0,  1.0,  0.0), // normal
+        0.5                   // r
+    };
+    if (hitDisk(ray, disk, hit)) {
+        pixel = vec3(1.0, 1.0, 0.0);
+    }
+
+    Sphere sphere = {
+        vec3(0.0, 0.0, -3.0), // center
+        1.0                   // radius
+    };
+    if (hitSphere(ray, sphere, hit)) {
+        pixel = 0.5 + 0.5 * hit.normal; // simple normal-based coloring
+    }
+
+    Sphere point = {
+        vec3(-2.0, 0.0, -3.0), // center
+        0.1                    // radius
+    };
+    if (hitSphere(ray, point, hit)) {
+        pixel = 0.5 + 0.5 * hit.normal; // simple normal-based coloring
+    }
+
+    Line line = {
+        vec3(2.0, 0.0, -3.0), // a
+        vec3(3.0, 0.0, -3.0), // b
+        0.01                  // radius
+    };
+    if (hitLineSegment(ray, line, hit)) {
+        pixel = 0.5 + 0.5 * hit.normal; // simple normal-based coloring
+    }
+
+    // +X axis: red
+    Line x = {
+        vec3(0.0, 0.0, 0.0), vec3(5.0, 0.0, 0.0), 0.01
+    };
+    if (hitLineSegment(ray, x, hit)) {
+        pixel = vec3(1.0, 0.0, 0.0);
+    }
+
+    // +Y axis: green
+    Line y = {
+        vec3(0.0, 0.0, 0.0), vec3(0.0, 5.0, 0.0), 0.01
+    };
+    if (hitLineSegment(ray, y, hit)) {
+        pixel = vec3(0.0, 1.0, 0.0);
+    }
+
+    // +Z axis: red
+    Line z = {
+        vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 5.0), 0.01
+    };
+    if (hitLineSegment(ray, z, hit)) {
+        pixel = vec3(0.0, 0.0, 1.0);
+    }
+
+    Box box = {
+        vec3(-2.0, 1.0, -2.0),
+        vec3(-1.0, 0.0, -1.0),
+    };
+    if (hitBox(ray, box, hit)) {
+        pixel = 0.5 + 0.5 * hit.normal; // simple normal-based coloring
+    }
+
+    Triangle tri = {
+        // position
+        vec3(2.5, 2.0, -3.0),
+        vec3(2.0, 1.0, -3.0),
+        vec3(3.0, 1.0, -3.0),
+        // uv
+        vec2(0.5, 1.0),
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+    };
+    if (hitTriangle(ray, tri, hit)) {
+        //pixel = 0.5 + 0.5 * hit.normal; // simple normal-based coloring
+        pixel = hit.normal; // normal is color
+    }
+
+    imageStore(imgOutput, pixelCoord, vec4(pixel,1.0));
+}
