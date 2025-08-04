@@ -41,7 +41,8 @@ const uint32_t HEIGHT = 1080;
 const uint32_t WG_X = 32;
 const uint32_t WG_Y = 32;
 
-const int MAX_FRAMES_IN_FLIGHT = 2;
+// 每个swapchain 都有自己的resource
+const int MAX_FRAMES_IN_FLIGHT = 3;
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"};
@@ -72,11 +73,13 @@ void DestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT
 }
 
 struct QueueFamilyIndices {
-    std::optional<uint32_t> graphicsAndComputeFamily;
+    std::optional<uint32_t> graphicsAndComputeFamily;  // only for gfx
+    // std::optional<uint32_t> computeFamily;             // compute
     std::optional<uint32_t> presentFamily;
 
     bool isComplete() {
-        return graphicsAndComputeFamily.has_value() && presentFamily.has_value();
+        // assert(graphicsAndComputeFamily != computeFamily);
+        return graphicsAndComputeFamily.has_value() /*&& computeFamily.has_value()*/ && presentFamily.has_value();
     }
 };
 
@@ -118,7 +121,7 @@ private:
     // 但是ray tracing in one weekend里面没有用yaw/pitch, 直接用的camera position (13, 2, 3)和lookat (0,0,0).
     // 用chatGPT帮忙反推得到对应的yaw和pitch.
     //            camera position               world up                     yaw      pitch
-    //Camera camera{glm::vec3(13.0f, 2.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), -167.2f, -8.5f};
+    // Camera camera{glm::vec3(13.0f, 2.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), -167.2f, -8.5f};
     Camera camera{glm::vec3(13.0f, 2.0f, 3.0f), glm::vec3(0.0f, 1.0f, 0.0f), -166.9f, -8.5f};
     Scene scene;
     bool autoRotate = false;
@@ -153,6 +156,7 @@ private:
     VkPipeline computePipeline;
 
     VkCommandPool commandPool;
+    VkCommandPool computeCommandPool;
 
     VkBuffer spheresBuffer;
     VkDeviceMemory spheresBufferMemory;
@@ -161,29 +165,31 @@ private:
     VkBuffer bvhNodesBuffer;
     VkDeviceMemory bvhNodesBufferMemory;
 
-    VkImageLayout currentStorageImageLayout;
-    VkImage storageImage;
-    VkDeviceMemory storageImageMemory;
-    VkImageView storageImageView;
+    std::vector<VkImageLayout> currentStorageImageLayout;
+    std::vector<VkImage> storageImage;
+    std::vector<VkDeviceMemory> storageImageMemory;
+    std::vector<VkImageView> storageImageView;
     VkSampler textureSampler;
 
-    // compute 是做rt的, 每个frame都是独立的
-    std::vector<VkBuffer> uniformBuffers;  // only one, not one for each frame
+    std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
     std::vector<void*> uniformBuffersMapped;
 
-    VkDescriptorPool descriptorPool;
-    std::vector<VkDescriptorSet> computeDescriptorSets;  // only one, not one for each frame
+    VkDescriptorPool descriptorPool;  // gfx/compute共用一个.
+    std::vector<VkDescriptorSet> computeDescriptorSets;
     std::vector<VkDescriptorSet> descriptorSets;
 
     std::vector<VkCommandBuffer> commandBuffers;
     std::vector<VkCommandBuffer> computeCommandBuffers;
 
+    // 3个, 对应3个swapchain images, 代表被present 完了, gfx画的render target, 要等这个
     std::vector<VkSemaphore> imageAvailableSemaphores;
+    // 3个, 对应3个swapchain images, gfx submit queue的时候一起提交, signal了代表gfx画完了, present要等这个.
     std::vector<VkSemaphore> renderFinishedSemaphores;
+    // 3个, 对应3个storage image, compute submit queue的时候一起提交, signal了代表compute写完了, gfx画的src tex, 要等这个
     std::vector<VkSemaphore> computeFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
-    std::vector<VkFence> computeInFlightFences;
+    // MAX_FRAMES_IN_FLIGHT = 3, 0/1/2
     uint32_t currentFrame = 0;
 
     float currentTime = 0.0f;
@@ -207,7 +213,7 @@ private:
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
         glfwSetWindowUserPointer(window, this);
         glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
-        //glfwSetCursorPosCallback(window, mouseCallback); // todo, 先不动camera
+        // glfwSetCursorPosCallback(window, mouseCallback); // todo, 先不动camera
         glfwSetCharCallback(window, characterCallback);
 
         // tell GLFW to capture our mouse
@@ -372,7 +378,7 @@ private:
 
         vkDestroyRenderPass(device, renderPass, nullptr);
 
-        for (size_t i = 0; i < 1; i++) {
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroyBuffer(device, uniformBuffers[i], nullptr);
             vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
         }
@@ -380,10 +386,12 @@ private:
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 
         vkDestroySampler(device, textureSampler, nullptr);
-        vkDestroyImageView(device, storageImageView, nullptr);
 
-        vkDestroyImage(device, storageImage, nullptr);
-        vkFreeMemory(device, storageImageMemory, nullptr);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroyImageView(device, storageImageView[i], nullptr);
+            vkDestroyImage(device, storageImage[i], nullptr);
+            vkFreeMemory(device, storageImageMemory[i], nullptr);
+        }
 
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
         vkDestroyDescriptorSetLayout(device, computeDescriptorSetLayout, nullptr);
@@ -400,10 +408,10 @@ private:
             vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
             vkDestroySemaphore(device, computeFinishedSemaphores[i], nullptr);
             vkDestroyFence(device, inFlightFences[i], nullptr);
-            vkDestroyFence(device, computeInFlightFences[i], nullptr);
         }
 
         vkDestroyCommandPool(device, commandPool, nullptr);
+        vkDestroyCommandPool(device, computeCommandPool, nullptr);
 
         vkDestroyDevice(device, nullptr);
 
@@ -527,15 +535,19 @@ private:
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
 
         std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-        std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsAndComputeFamily.value(), indices.presentFamily.value()};
+        // std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsAndComputeFamily.value(), indices.computeFamily.value(), indices.presentFamily.value()};
+        std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsAndComputeFamily.value()};
 
-        float queuePriority = 1.0f;
+        // float queuePriority = 1.0f;
+        std::vector<float> queuePriorities = {
+            1.0f, 1.0f, 1.0f};
         for (uint32_t queueFamily : uniqueQueueFamilies) {
             VkDeviceQueueCreateInfo queueCreateInfo{};
             queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
             queueCreateInfo.queueFamilyIndex = queueFamily;
-            queueCreateInfo.queueCount = 1;
-            queueCreateInfo.pQueuePriorities = &queuePriority;
+            queueCreateInfo.queueCount = 3;  // 这里默认gfx/compute/present是同一个family, 里面分配3个queue., 如果不是, 再改.
+            // queueCreateInfo.pQueuePriorities = &queuePriority;
+            queueCreateInfo.pQueuePriorities = queuePriorities.data();
             queueCreateInfos.push_back(queueCreateInfo);
         }
 
@@ -564,8 +576,9 @@ private:
         }
 
         vkGetDeviceQueue(device, indices.graphicsAndComputeFamily.value(), 0, &graphicsQueue);
-        vkGetDeviceQueue(device, indices.graphicsAndComputeFamily.value(), 0, &computeQueue);
-        vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
+        vkGetDeviceQueue(device, indices.graphicsAndComputeFamily.value(), 1, &computeQueue);
+        assert(graphicsQueue != computeQueue);
+        vkGetDeviceQueue(device, indices.graphicsAndComputeFamily.value(), 2, &presentQueue);
     }
 
     void createSwapChain() {
@@ -592,9 +605,12 @@ private:
         createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        // 0,2,0
+        // uint32_t queueFamilyIndices[] = {indices.graphicsAndComputeFamily.value(), indices.computeFamily.value(), indices.presentFamily.value()};
         uint32_t queueFamilyIndices[] = {indices.graphicsAndComputeFamily.value(), indices.presentFamily.value()};
 
         if (indices.graphicsAndComputeFamily != indices.presentFamily) {
+            // if (true) {  // 这里手动指定了idx 0, 2, 用concurrent mode
             createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
             createInfo.queueFamilyIndexCount = 2;
             createInfo.pQueueFamilyIndices = queueFamilyIndices;
@@ -922,6 +938,19 @@ private:
         if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
             throw std::runtime_error("failed to create graphics command pool!");
         }
+
+        {
+            // for compute
+            VkCommandPoolCreateInfo poolInfo{};
+            poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            // poolInfo.queueFamilyIndex = queueFamilyIndices.computeFamily.value();
+            poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsAndComputeFamily.value();
+
+            if (vkCreateCommandPool(device, &poolInfo, nullptr, &computeCommandPool) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create compute command pool!");
+            }
+        }
     }
 
     void createShaderStorageBuffers() {
@@ -990,13 +1019,21 @@ private:
     }
 
     void createShaderStorageImage() {
-        createImage(WIDTH, HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, storageImage, storageImageMemory);
-        currentStorageImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        currentStorageImageLayout.resize(MAX_FRAMES_IN_FLIGHT);
+        storageImage.resize(MAX_FRAMES_IN_FLIGHT);
+        storageImageView.resize(MAX_FRAMES_IN_FLIGHT);
+        storageImageMemory.resize(MAX_FRAMES_IN_FLIGHT);
 
-        transitionImageLayout(storageImage, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        currentStorageImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            createImage(WIDTH, HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, storageImage[i], storageImageMemory[i]);
+            currentStorageImageLayout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        storageImageView = createImageView(storageImage, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
+            // 这个应该没关系, 用默认的gfx cmd pool
+            transitionImageLayout(storageImage[i], VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            currentStorageImageLayout[i] = VK_IMAGE_LAYOUT_GENERAL;
+
+            storageImageView[i] = createImageView(storageImage[i], VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
     }
 
     void createTextureSampler() {
@@ -1045,7 +1082,11 @@ private:
         return imageView;
     }
 
+    // 这个函数目前知识用来创建vkimage (cs画, gfx show)
     void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+        // QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        // uint32_t queueFamilyIndices[] = {indices.graphicsAndComputeFamily.value(), indices.computeFamily.value()};
+
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -1059,7 +1100,10 @@ private:
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageInfo.usage = usage;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        // imageInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // imageInfo.queueFamilyIndexCount = 2;
+        // imageInfo.pQueueFamilyIndices = queueFamilyIndices;
 
         if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
             throw std::runtime_error("failed to create image!");
@@ -1174,11 +1218,11 @@ private:
     void createUniformBuffers() {
         VkDeviceSize bufferSize = sizeof(UniformBufferObject);
 
-        uniformBuffers.resize(1);
-        uniformBuffersMemory.resize(1);
-        uniformBuffersMapped.resize(1);
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
 
-        for (size_t i = 0; i < 1; i++) {
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
 
             vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
@@ -1190,28 +1234,30 @@ private:
         // VkDescriptorPoolSize这个名字真是烂到几点, 它是描述某种类型的descriptor.
         std::array<VkDescriptorPoolSize, 4> poolSizes{};
 
-        // descriptor类型0, cs用的image2D, 只有一个
+        // descriptor类型0, cs用的image2D, 每帧一个, 共3个
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[0].descriptorCount = 1;
+        poolSizes[0].descriptorCount = MAX_FRAMES_IN_FLIGHT;
 
-        // descriptor类型1, cs用的ubo, 只有一个
+        // descriptor类型1, cs用的ubo, 每帧一个, 共3个
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[1].descriptorCount = 1;
+        poolSizes[1].descriptorCount = MAX_FRAMES_IN_FLIGHT;
 
-        // descriptor类型2, cs用的ssbo, 有3个, sphereBuf, primitiveBuf, bvhBuf
+        // descriptor类型2, cs用的ssbo, 每帧3个, sphereBuf, primitiveBuf, bvhBuf, 共9个
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[2].descriptorCount = 3;
+        poolSizes[2].descriptorCount = MAX_FRAMES_IN_FLIGHT * 3;
 
-        // descriptor类型3, gfx用的sampler2D, 每帧一个, 共2
+        // descriptor类型3, gfx用的sampler2D, 每帧一个, 共3个
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[3].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolSizes[3].descriptorCount = MAX_FRAMES_IN_FLIGHT;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolInfo.pPoolSizes = poolSizes.data();
-        // 总共需要分配 DS 的个数：1 compute + MAX_FRAMES_IN_FLIGHT graphics
-        poolInfo.maxSets = 5;
+        // 上面是descriptor类型, 这里是descriptor set 个数.
+        // 一个compute frame 一个DS, 一个gfx frame 一个DS, 即一个frame 2个DS
+        // 共 MAX_FRAMES_IN_FLIGHT * (1 compute shader + 1 gfx shader)
+        poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT * 2;
 
         if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor pool!");
@@ -1219,14 +1265,14 @@ private:
     }
 
     void createDescriptorSets() {
-        // 两个一样的DS layout, 每个frame一个.
         std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         // 从descriptor pool里面分配 descriptor.
         allocInfo.descriptorPool = descriptorPool;
         allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
-        allocInfo.pSetLayouts = layouts.data();
+        allocInfo.pSetLayouts = layouts.data();  // 这里的layout要和上面的descriptorSetCount长度一样.
 
         // 给descriptor set分配空间, descriptor是从pool里面分配的, 但是descriptor set还是要空间的.
         descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
@@ -1234,16 +1280,16 @@ private:
             throw std::runtime_error("failed to allocate descriptor sets!");
         }
 
-        // 每个frame一个descriptor set.
+        // 每个frame一个descriptor set, 每个DS都有对应的VkWriteDescriptorSet, 即把资源写进descriptor set.
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            std::array<VkWriteDescriptorSet, 1> descriptorWrites{};
+
+            // DS0, FS里面只用了texture这个资源.
             VkDescriptorImageInfo imageInfo{};
             imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            imageInfo.imageView = storageImageView;
+            imageInfo.imageView = storageImageView[i];
             // 这个descriptor是用来做sampler的, 要知道sampler信息.
             imageInfo.sampler = textureSampler;
-
-            // 用两个VkWriteDescriptorSet创建(更新)两个DS, 即把资源写进descriptor set.
-            std::array<VkWriteDescriptorSet, 1> descriptorWrites{};
 
             descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptorWrites[0].dstSet = descriptorSets[i];
@@ -1259,25 +1305,29 @@ private:
 
     // 一个image/ubo就可以了, 不用每个frame都分配一个. DS layout也只要一个.
     void createComputeDescriptorSets() {
-        std::vector<VkDescriptorSetLayout> layouts(1, computeDescriptorSetLayout);
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, computeDescriptorSetLayout);
+
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocInfo.descriptorPool = descriptorPool;
-        allocInfo.descriptorSetCount = static_cast<uint32_t>(1);
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
         allocInfo.pSetLayouts = layouts.data();
 
-        computeDescriptorSets.resize(1);
+        computeDescriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
         if (vkAllocateDescriptorSets(device, &allocInfo, computeDescriptorSets.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate descriptor sets!");
         }
 
-        for (size_t i = 0; i < 1; i++) {
+        // 每个frame一个descriptor set, 每个DS都有对应的VkWriteDescriptorSet, 即把资源写进descriptor set.
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            std::array<VkWriteDescriptorSet, 5> descriptorWrites{};
+
+            // DS0, UBO
             VkDescriptorBufferInfo uniformBufferInfo{};
             uniformBufferInfo.buffer = uniformBuffers[i];
             uniformBufferInfo.offset = 0;
             uniformBufferInfo.range = sizeof(UniformBufferObject);
 
-            std::array<VkWriteDescriptorSet, 5> descriptorWrites{};
             descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptorWrites[0].dstSet = computeDescriptorSets[i];
             descriptorWrites[0].dstBinding = 0;
@@ -1286,9 +1336,10 @@ private:
             descriptorWrites[0].descriptorCount = 1;
             descriptorWrites[0].pBufferInfo = &uniformBufferInfo;
 
+            // DS1, storage image
             VkDescriptorImageInfo imageInfo{};
             imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            imageInfo.imageView = storageImageView;
+            imageInfo.imageView = storageImageView[i];
             imageInfo.sampler = VK_NULL_HANDLE;
 
             descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1299,6 +1350,7 @@ private:
             descriptorWrites[1].descriptorCount = 1;
             descriptorWrites[1].pImageInfo = &imageInfo;
 
+            // DS2-4, 三个storage buffer
             std::array<VkDescriptorBufferInfo, 3> storageBufferInfos{};
             storageBufferInfos[0].buffer = spheresBuffer;
             storageBufferInfos[0].offset = 0;
@@ -1463,7 +1515,7 @@ private:
 
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = commandPool;
+        allocInfo.commandPool = computeCommandPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandBufferCount = (uint32_t)computeCommandBuffers.size();
 
@@ -1478,6 +1530,29 @@ private:
 
         if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
             throw std::runtime_error("failed to begin recording command buffer!");
+        }
+
+        if (currentStorageImageLayout[currentFrame] == VK_IMAGE_LAYOUT_GENERAL) {
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.srcAccessMask = 0;  // 顺序由前面提交的等待来保证
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = storageImage[currentFrame];
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,  // 在 gfx 队列里，不要写 COMPUTE
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0, nullptr, 0, nullptr,
+                1, &b);
+
+            currentStorageImageLayout[currentFrame] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
         VkRenderPassBeginInfo renderPassInfo{};
@@ -1530,11 +1605,36 @@ private:
             throw std::runtime_error("failed to begin recording compute command buffer!");
         }
 
+        // when created, it is VK_IMAGE_LAYOUT_GENERAL.
+        if (currentStorageImageLayout[currentFrame] == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.srcAccessMask = 0;  // 由提交处的等待/顺序保证
+            b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = storageImage[currentFrame];
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+            // ！！！注意：这是 compute 队列，src/dst 只能用本队列支持的阶段！！！
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,  // 不要填 FRAGMENT_SHADER_BIT
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr, 0, nullptr,
+                1, &b);
+
+            currentStorageImageLayout[currentFrame] = VK_IMAGE_LAYOUT_GENERAL;
+        }
+
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
 
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &computeDescriptorSets[0], 0, nullptr);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &computeDescriptorSets[currentFrame], 0, nullptr);
 
-        vkCmdDispatch(commandBuffer, (WIDTH + WG_X-1) / WG_X, (HEIGHT + WG_Y-1) / WG_Y, 1);
+        vkCmdDispatch(commandBuffer, (WIDTH + WG_X - 1) / WG_X, (HEIGHT + WG_Y - 1) / WG_Y, 1);
 
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
             throw std::runtime_error("failed to record compute command buffer!");
@@ -1546,7 +1646,6 @@ private:
         renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
         computeFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
         inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
-        computeInFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
 
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -1561,16 +1660,13 @@ private:
                 vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
                 throw std::runtime_error("failed to create graphics synchronization objects for a frame!");
             }
-            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &computeFinishedSemaphores[i]) != VK_SUCCESS ||
-                vkCreateFence(device, &fenceInfo, nullptr, &computeInFlightFences[i]) != VK_SUCCESS) {
+            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &computeFinishedSemaphores[i]) != VK_SUCCESS) {
                 throw std::runtime_error("failed to create compute synchronization objects for a frame!");
             }
         }
     }
 
-    void updateUniformBuffer(uint32_t currentImage) {
-        (void)currentImage;
-
+    void updateUniformBuffer(uint32_t currentFrame) {
         UniformBufferObject ubo{};
         ubo.cameraPosition = camera.Position;
         ubo.currentTime = this->currentTime;
@@ -1580,49 +1676,33 @@ private:
         ubo.debugKey = this->debugKey;
         ubo.cameraRight = camera.Right;
 
-        // only one ubo compute pass
-        memcpy(uniformBuffersMapped[0], &ubo, sizeof(ubo));
+        memcpy(uniformBuffersMapped[currentFrame], &ubo, sizeof(ubo));
     }
 
     void drawFrame() {
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        // 1) 等待上一轮使用同一 frame slot 的 GPU 工作彻底结束
+        vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);  // 这次 submit 结束后会 signal 它
 
-        // Compute submission
-        vkWaitForFences(device, 1, &computeInFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+        // vkDeviceWaitIdle(device);
 
-        // when created, it is VK_IMAGE_LAYOUT_GENERAL.
-        if (currentStorageImageLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            transitionImageLayout(storageImage, VK_FORMAT_R32G32B32A32_SFLOAT,
-                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                  VK_IMAGE_LAYOUT_GENERAL);
-            currentStorageImageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-
+        // 2) CPU 更新/录制/提交 Compute（不再用 compute fence）
         updateUniformBuffer(currentFrame);
-
-        vkResetFences(device, 1, &computeInFlightFences[currentFrame]);
-
         vkResetCommandBuffer(computeCommandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
         recordComputeCommandBuffer(computeCommandBuffers[currentFrame]);
 
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &computeCommandBuffers[currentFrame];
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &computeFinishedSemaphores[currentFrame];
 
-        if (vkQueueSubmit(computeQueue, 1, &submitInfo, computeInFlightFences[currentFrame]) != VK_SUCCESS) {
+        if (vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
             throw std::runtime_error("failed to submit compute command buffer!");
         };
 
-        transitionImageLayout(storageImage, VK_FORMAT_R32G32B32A32_SFLOAT,
-                              VK_IMAGE_LAYOUT_GENERAL,
-                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        currentStorageImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        // Graphics submission
-        vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
-
+        // 3) Acquire 当前 swapchain image
         uint32_t imageIndex;
         VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
 
@@ -1633,16 +1713,19 @@ private:
             throw std::runtime_error("failed to acquire swap chain image!");
         }
 
-        vkResetFences(device, 1, &inFlightFences[currentFrame]);
-
+        // 4) 录制并提交 Graphics，等待：a) acquire，b) 本帧 compute 完成
         vkResetCommandBuffer(commandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
         recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
-        VkSemaphore waitSemaphores[] = {computeFinishedSemaphores[currentFrame], imageAvailableSemaphores[currentFrame]};
-        VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        VkSemaphore waitSemaphores[] = {
+            computeFinishedSemaphores[currentFrame],
+            imageAvailableSemaphores[currentFrame]};
+        VkPipelineStageFlags waitStages[] = {
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,  // 等 compute 写完再在 FS 读
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+
         submitInfo = {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-
         submitInfo.waitSemaphoreCount = 2;
         submitInfo.pWaitSemaphores = waitSemaphores;
         submitInfo.pWaitDstStageMask = waitStages;
@@ -1661,16 +1744,14 @@ private:
             dumpFramebuffer = false;
         }
 
+        // 5) Present 等待 graphics 完成
+        VkSwapchainKHR swapChains[] = {swapChain};
         VkPresentInfoKHR presentInfo{};
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-
         presentInfo.waitSemaphoreCount = 1;
         presentInfo.pWaitSemaphores = &renderFinishedSemaphores[currentFrame];
-
-        VkSwapchainKHR swapChains[] = {swapChain};
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = swapChains;
-
         presentInfo.pImageIndices = &imageIndex;
 
         result = vkQueuePresentKHR(presentQueue, &presentInfo);
@@ -1821,6 +1902,8 @@ private:
 
             i++;
         }
+
+        // indices.computeFamily = 2;
 
         return indices;
     }

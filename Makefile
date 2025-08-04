@@ -1,4 +1,4 @@
-#BUILD_FLAVOR        := release
+BUILD_FLAVOR        := release
 
 PLATFORM            := WINDOWS
 ifeq ($(shell uname -s),Linux)
@@ -13,7 +13,7 @@ endif
 ifeq ($(PLATFORM),WINDOWS)
     VULKAN_SDK      := C://VulkanSDK/1.4.313.2
     VULKAN_FLAGS    := -I$(VULKAN_SDK)/Include -L$(VULKAN_SDK)/Lib -lvulkan-1
-    COMPILER        := $(VULKAN_SDK)/Bin/glslc.exe
+    COMPILER        := $(VULKAN_SDK)/Bin/glslangValidator.exe
     COMPILER_FLAGS  :=
 
     GLFW3_PATH      := dean/3rdparty/glfw-3.3.8.bin.WIN64
