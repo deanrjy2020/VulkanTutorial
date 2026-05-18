@@ -72,7 +72,7 @@ Since Vulkan shifts the responsiblity for the allocation to the driver, it is no
 longer a strict requirement to only allocate as many descriptors of a certain
 type (`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`, etc.) as specified by the
 corresponding `descriptorCount` members for the creation of the descriptor pool.
-However, it remains best practise to do so, and in the future,
+However, it remains best practice to do so, and in the future,
 `VK_LAYER_KHRONOS_validation` will warn about this type of problem if you enable
 [Best Practice Validation](https://vulkan.lunarg.com/doc/view/1.4.304.0/linux/best_practices.html).
 
