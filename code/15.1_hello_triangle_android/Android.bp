@@ -1,0 +1,46 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "frameworks_native_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["frameworks_native_license"],
+}
+
+// Vulkan Tutorial chapter 15.1, built as an adb shell binary.
+// A native window comes from SurfaceFlinger via libglTest's WindowSurface.
+// Push shaders/*.spv next to the binary and run from that directory as root.
+cc_defaults {
+    name: "vt_chapter_defaults",
+
+    shared_libs: [
+        "libvulkan",
+        "libnativewindow",
+        "libgui",
+        "libui",
+        "libutils",
+        "libcutils",
+        "libEGL",
+    ],
+
+    static_libs: ["libglTest"],
+
+    // No -std override: AOSP defaults to C++20 and libgui headers need it.
+    cppflags: ["-fexceptions"],
+
+    cflags: [
+        // Soong's global cflags use -O2; the later -O0 wins, for single-stepping.
+        "-O0",
+        "-Wall",
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+        "-Wno-unused-const-variable",
+    ],
+}
+
+// Shaders are not built here; run ./compile_shaders.sh.
+cc_binary {
+    name: "15.1_hello_triangle_android",
+    defaults: ["vt_chapter_defaults"],
+    srcs: ["15.1_hello_triangle_android.cpp"],
+}

@@ -1,0 +1,62 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Windows debug",
+      "type": "cppdbg",
+      "request": "launch",
+      //"program": "${workspaceFolder}/build/15_hello_triangle/15_hello_triangle.exe",
+      "program": "${workspaceFolder}/build/27_depth_buffering/27_depth_buffering.exe",
+      "args": [],
+      //"cwd": "${workspaceFolder}/build/15_hello_triangle",
+      "cwd": "${workspaceFolder}/build/27_depth_buffering",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/mingw64/bin/gdb.exe",
+      "externalConsole": true
+    },
+    {
+      "name": "Linux debug",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/${input:chapter}/${input:chapter}",
+      "args": [],
+      "cwd": "${workspaceFolder}/build/${input:chapter}",
+      "stopAtEntry": false,
+      "environment": [
+        // Debug build会开VK_LAYER_KHRONOS_validation, 找不到会throw. 从Vulkan SDK里找layer.
+        {"name": "VK_ADD_LAYER_PATH", "value": "${env:HOME}/bin/vulkansdk/1.4.335.0/x86_64/share/vulkan/explicit_layer.d"}
+      ],
+      "MIMode": "gdb",
+      "externalConsole": false
+    },
+    {
+      // Android: 需要CodeLLDB(vadimcn.vscode-lldb), 先在AOSP里 m 15.1_hello_triangle_android + compile_shaders.sh.
+      // lldb会把program(symbols版, 带debug info)上传到remote working dir(/data/local/tmp/vt)再launch.
+      "name": "15.1 android",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/../../../../out_erd9965_b_bp2a_eng/target/product/erd9965/symbols/system/bin/15.1_hello_triangle_android",
+      "args": ["600"],
+      "preLaunchTask": "15.1 android setup",
+      "initCommands": [
+        "platform select remote-android",
+        "platform connect connect://0000090dcf8747d3:4039",
+        "platform settings -w /data/local/tmp/vt",
+        "settings set target.inherit-env false",
+        "settings append target.exec-search-paths ${workspaceFolder}/../../../../out_erd9965_b_bp2a_eng/target/product/erd9965/symbols/system/lib64"
+      ],
+      // AOSP的debug info里是相对AOSP根目录的路径(frameworks/native/...), 没有comp_dir.
+      "relativePathBase": "${workspaceFolder}/../../../.."
+    }
+  ],
+  "inputs": [
+    {
+      // CMakeLists.txt里add_chapter的名字, build目录和binary都用这个名字.
+      "id": "chapter",
+      "type": "promptString",
+      "description": "Chapter to debug (add_chapter name in code/CMakeLists.txt)",
+      "default": "50.1_dynamic_rendering"
+    }
+  ]
+}

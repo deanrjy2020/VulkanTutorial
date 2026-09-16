@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // adb root(WindowSurface需要), push shaders, 启动lldb-server(没有就从AOSP prebuilts push一个).
+      "label": "15.1 android setup",
+      "type": "shell",
+      "command": "adb root && adb wait-for-device && adb shell mkdir -p /data/local/tmp/vt/shaders && adb push ${workspaceFolder}/code/15.1_hello_triangle_android/shaders/. /data/local/tmp/vt/shaders/ && (adb shell '[ -x /data/local/tmp/lldb-server ]' || (adb push ${workspaceFolder}/../../../../prebuilts/clang/host/linux-x86/clang-r547379/runtimes_ndk_cxx/aarch64/lldb-server /data/local/tmp/ && adb shell chmod +x /data/local/tmp/lldb-server)); adb shell pkill lldb-server; adb shell \"cd /data/local/tmp && (nohup ./lldb-server platform --server --listen *:4039 >/dev/null 2>&1 &)\" && exit 0",
+      "problemMatcher": [],
+      "presentation": {
+        "close": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+# 只给Android(NDK toolchain)用, 和gtb的--android-executable一样编一个adb shell binary.
+# Windows/Linux的GLFW版本在../CMakeLists.txt里编, 那边不会add_subdirectory这里.
+# 用法见同目录readme.txt.
+cmake_minimum_required (VERSION 3.10)
+
+project (50.1_dynamic_rendering CXX)
+
+if (NOT ANDROID)
+  message (FATAL_ERROR "This CMakeLists.txt is Android only, configure with -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake")
+endif ()
+
+# vkCmdBeginRendering/vkCmdPipelineBarrier2是1.3 core, NDK的libvulkan.so stub从android-33才导出, 低于33会link不上.
+if (ANDROID_PLATFORM_LEVEL LESS 33)
+  message (FATAL_ERROR "50.1_dynamic_rendering needs -DANDROID_PLATFORM=android-33 or later (got ${ANDROID_PLATFORM_LEVEL})")
+endif ()
+
+set (CHAPTER_NAME 50.1_dynamic_rendering)
+
+add_executable (${CHAPTER_NAME} ${CHAPTER_NAME}.cpp)
+set_target_properties (${CHAPTER_NAME} PROPERTIES CXX_STANDARD 17)
+# NDK sysroot里有libvulkan.so (stub, 运行时用device上的/system/lib64/libvulkan.so).
+target_link_libraries (${CHAPTER_NAME} vulkan)
+# stb_image_write.h, 和../CMakeLists.txt的STB_INCLUDEDIR是同一个目录.
+target_include_directories (${CHAPTER_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty)
+
+# shader用NDK自带的glslc编, 不依赖VULKAN_SDK和AOSP.
+find_program (GLSLC glslc HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}" NO_DEFAULT_PATH REQUIRED)
+
+set (SHADERS_DIR ${CMAKE_BINARY_DIR}/shaders)
+set (SHADER_BASE ${CMAKE_CURRENT_SOURCE_DIR}/${CHAPTER_NAME})
+add_custom_command (
+  OUTPUT ${SHADERS_DIR}/vert.spv ${SHADERS_DIR}/frag.spv
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
+  COMMAND ${GLSLC} --target-env=vulkan1.0 ${SHADER_BASE}.vert -o ${SHADERS_DIR}/vert.spv
+  COMMAND ${GLSLC} --target-env=vulkan1.0 ${SHADER_BASE}.frag -o ${SHADERS_DIR}/frag.spv
+  DEPENDS ${SHADER_BASE}.vert ${SHADER_BASE}.frag
+  COMMENT "Compiling Shaders"
+  VERBATIM
+  )
+add_custom_target (${CHAPTER_NAME}_shader DEPENDS ${SHADERS_DIR}/vert.spv ${SHADERS_DIR}/frag.spv)
+add_dependencies (${CHAPTER_NAME} ${CHAPTER_NAME}_shader)
