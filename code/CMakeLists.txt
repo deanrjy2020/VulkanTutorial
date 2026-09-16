@@ -2,20 +2,9 @@ cmake_minimum_required (VERSION 3.8)
 
 project (VulkanTutorial)
 
-find_package (glfw3 REQUIRED)
-find_package (glm REQUIRED)
+# 从仓库内的 thirdparty 目录加载 GLFW、GLM、STB 和 tinyobjloader
+add_subdirectory ("${CMAKE_CURRENT_SOURCE_DIR}/3rdparty" thirdparty)
 find_package (Vulkan REQUIRED)
-find_package (tinyobjloader REQUIRED)
-
-find_package (PkgConfig)
-pkg_get_variable (STB_INCLUDEDIR stb includedir)
-if (NOT STB_INCLUDEDIR)
-  unset (STB_INCLUDEDIR)
-  find_path (STB_INCLUDEDIR stb_image.h PATH_SUFFIXES stb)
-endif ()
-if (NOT STB_INCLUDEDIR)
-  message (FATAL_ERROR "stb_image.h not found")
-endif ()
 
 add_executable (glslang::validator IMPORTED)
 find_program (GLSLANG_VALIDATOR "glslangValidator" HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
@@ -23,11 +12,9 @@ set_property (TARGET glslang::validator PROPERTY IMPORTED_LOCATION "${GLSLANG_VA
 
 function (add_shaders_target TARGET)
   cmake_parse_arguments ("SHADER" "" "CHAPTER_NAME" "SOURCES" ${ARGN})
-  set (SHADERS_DIR ${SHADER_CHAPTER_NAME}/shaders)
-  add_custom_command (
-    OUTPUT ${SHADERS_DIR}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
-    )
+  # RUNTIME_OUTPUT_DIRECTORY 已将可执行文件放在章节目录中；shader 也必须
+  # 放在同一目录下，程序从资源管理器双击启动时才能找到 shaders/*.spv。
+  set (SHADERS_DIR ${CMAKE_BINARY_DIR}/${SHADER_CHAPTER_NAME}/shaders)
   set (SHADERS ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv)
   # Some chapters may have compute shaders in addition to vertex and fragment shaders,
   # so we conditionally check this and add them to the target
@@ -37,10 +24,12 @@ function (add_shaders_target TARGET)
   endif()
   add_custom_command (
     OUTPUT ${SHADERS}
+    # 编译着色器前确保目标目录存在
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
     COMMAND glslang::validator
     ARGS --target-env vulkan1.0 ${SHADER_SOURCES} --quiet
     WORKING_DIRECTORY ${SHADERS_DIR}
-    DEPENDS ${SHADERS_DIR} ${SHADER_SOURCES}
+    DEPENDS ${SHADER_SOURCES}
     COMMENT "Compiling Shaders"
     VERBATIM
     )
@@ -48,14 +37,24 @@ function (add_shaders_target TARGET)
 endfunction ()
 
 function (add_chapter CHAPTER_NAME)
-  cmake_parse_arguments (CHAPTER "" "SHADER" "LIBS;TEXTURES;MODELS" ${ARGN})
+  cmake_parse_arguments (CHAPTER "" "SOURCE;SHADER" "LIBS;TEXTURES;MODELS" ${ARGN})
 
-  add_executable (${CHAPTER_NAME} ${CHAPTER_NAME}.cpp)
+  if (NOT DEFINED CHAPTER_SOURCE)
+    set (CHAPTER_SOURCE ${CHAPTER_NAME}.cpp)
+  endif ()
+  add_executable (${CHAPTER_NAME} ${CHAPTER_SOURCE})
   set_target_properties (${CHAPTER_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${CHAPTER_NAME})
   set_target_properties (${CHAPTER_NAME} PROPERTIES CXX_STANDARD 17)
   target_link_libraries (${CHAPTER_NAME} Vulkan::Vulkan glfw)
   target_include_directories (${CHAPTER_NAME} PRIVATE ${STB_INCLUDEDIR})
+
+  # 将 GLFW 动态库复制到可执行文件旁，方便直接运行程序
+  if (WIN32 AND TARGET glfw)
+    add_custom_command (TARGET ${CHAPTER_NAME} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:glfw> $<TARGET_FILE_DIR:${CHAPTER_NAME}>)
+  endif ()
 
   if (DEFINED CHAPTER_SHADER)
     set (CHAPTER_SHADER_TARGET ${CHAPTER_NAME}_shader)
@@ -67,10 +66,24 @@ function (add_chapter CHAPTER_NAME)
     target_link_libraries (${CHAPTER_NAME} ${CHAPTER_LIBS})
   endif ()
   if (DEFINED CHAPTER_MODELS)
-    file (COPY ${CHAPTER_MODELS} DESTINATION ${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/models)
+    # 将模型复制到可执行文件同级的 models 目录
+    add_custom_command (TARGET ${CHAPTER_NAME} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:${CHAPTER_NAME}>/models"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CHAPTER_MODELS} "$<TARGET_FILE_DIR:${CHAPTER_NAME}>/models"
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      VERBATIM)
   endif ()
   if (DEFINED CHAPTER_TEXTURES)
-    file (COPY ${CHAPTER_TEXTURES} DESTINATION ${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/textures)
+    # 将纹理复制到可执行文件同级的 textures 目录
+    add_custom_command (TARGET ${CHAPTER_NAME} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:${CHAPTER_NAME}>/textures"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CHAPTER_TEXTURES} "$<TARGET_FILE_DIR:${CHAPTER_NAME}>/textures"
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      VERBATIM)
   endif ()
 endfunction ()
 
@@ -163,6 +176,12 @@ add_chapter (27_depth_buffering
   TEXTURES ../images/texture.jpg
   LIBS glm::glm)
 
+add_chapter (27.1_depth_buffering_fix
+  SOURCE 27.1_depth_buffering_fix/27.1_depth_buffering_fix.cpp
+  SHADER 27.1_depth_buffering_fix/27.1_depth_buffering_fix
+  TEXTURES ../images/texture.jpg
+  LIBS glm::glm)
+
 add_chapter (28_model_loading
   SHADER 27_shader_depth
   MODELS ../resources/viking_room.obj
@@ -183,4 +202,22 @@ add_chapter (30_multisampling
 
 add_chapter (31_compute_shader
   SHADER 31_shader_compute
+  LIBS glm::glm)
+
+add_chapter (31.1_cs_rt_basic
+  SOURCE 31.1_cs_rt_basic/31.1_cs_rt_basic.cpp
+  SHADER 31.1_cs_rt_basic/31.1_cs_rt_basic
+  LIBS glm::glm)
+target_include_directories (31.1_cs_rt_basic PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/includes")
+
+add_chapter (31.2_cs_rt_bvh
+  SOURCE 31.2_cs_rt_bvh/31.2_cs_rt_bvh.cpp
+  SHADER 31.2_cs_rt_bvh/31.2_cs_rt_bvh
+  LIBS glm::glm)
+target_include_directories (31.2_cs_rt_bvh PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/includes")
+
+add_chapter (40_vk_rt_basic
+  SOURCE 40_vk_rt_basic/40_vk_rt_basic.cpp
+  SHADER 40_vk_rt_basic/40_vk_rt_basic
+  TEXTURES ../images/texture.jpg
   LIBS glm::glm)

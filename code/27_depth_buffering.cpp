@@ -26,6 +26,24 @@
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
 
+/*
+“先分配 descriptor，再组装成 set”这个模型不对。
+[第 1128 行 (line 1128)](/D:/VulkanTutorial/code/27_depth_buffering.cpp:1128)：vkAllocateDescriptorSets 直接从 pool 分配 set，同时消耗相应类型的 descriptor 配额。descriptorSets.resize() 只给 CPU 侧保存 handle 的数组分配空间。
+[第 1164 行 (line 1164)](/D:/VulkanTutorial/code/27_depth_buffering.cpp:1164) 也应改成：两个 VkWriteDescriptorSet 更新同一个 set 的两个 binding，不是更新两个 set；写入的是资源引用等描述信息，不是资源数据。官方说明
+
+DEVICE_LOCAL 不意味着 CPU 不能访问，VBO 也不是必须 staging。
+[第 1055 行 (line 1055)](/D:/VulkanTutorial/code/27_depth_buffering.cpp:1055)、[第 1088 行 (line 1088)](/D:/VulkanTutorial/code/27_depth_buffering.cpp:1088)、[第 1187 行 (line 1187)](/D:/VulkanTutorial/code/27_depth_buffering.cpp:1187)：
+能否 vkMapMemory 看的是 HOST_VISIBLE。同一种 memory type 可以同时具有 DEVICE_LOCAL | HOST_VISIBLE，例如 UMA 上常见这种组合。staging 是常用上传方案，不是所有 VBO 都必须走的机制；“HOST_VISIBLE 性能远低”“DEVICE_LOCAL 性能最好”也不能一概而论。官方内存说明
+*/
+
+// 共享的:
+//   descriptor pool 只有一个
+// 每个in flight frame有自己的:
+//   fence和semaphore
+//   UBO
+//   descriptor set
+//   descriptor set layout 两个一样的DS layout
+//   command buffer
 const int MAX_FRAMES_IN_FLIGHT = 2;
 
 const std::vector<const char*> validationLayers = {
@@ -78,6 +96,10 @@ struct Vertex {
     glm::vec3 color;
     glm::vec2 texCoord;
 
+    // 这个是面向binding point的, 一个point对应一个binding description
+    // VBO也是binding到这个point上的, 在vkCmdBeginRenderPass后的vkCmdBindPipeline后的vkCmdBindVertexBuffers
+    // 这里的description事实上在描述某个binding point的VBO的stride.
+    // 见vertex input description page的图片.
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
         bindingDescription.binding = 0;
@@ -87,6 +109,8 @@ struct Vertex {
         return bindingDescription;
     }
 
+    // 这个是面向attribute的, 一个attribute对应一个attribute description, 所以这里是3个元素的array.
+    // attribute指定在哪个bingding里面
     static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
         std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
 
@@ -109,6 +133,7 @@ struct Vertex {
     }
 };
 
+// 一个ubo里面就有三个mat4.
 struct UniformBufferObject {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
@@ -184,6 +209,7 @@ private:
 
     std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
+    // map好的point, cpu直接往这个指针里写就可以了.
     std::vector<void*> uniformBuffersMapped;
 
     VkDescriptorPool descriptorPool;
@@ -353,11 +379,13 @@ private:
         createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         createInfo.ppEnabledExtensionNames = extensions.data();
 
+        // 如果开启了validation layers, 则需要添加validation layers.
         VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
         if (enableValidationLayers) {
             createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
             createInfo.ppEnabledLayerNames = validationLayers.data();
 
+            // 设置debug messenger的回调函数.
             populateDebugMessengerCreateInfo(debugCreateInfo);
             createInfo.pNext = (VkDebugUtilsMessengerCreateInfoEXT*) &debugCreateInfo;
         } else {
@@ -425,6 +453,7 @@ private:
         std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
         std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsFamily.value(), indices.presentFamily.value()};
 
+        // 创建的时候指定创建q的个数, 还有从哪个queueFamilyIndex里面创建
         float queuePriority = 1.0f;
         for (uint32_t queueFamily : uniqueQueueFamilies) {
             VkDeviceQueueCreateInfo queueCreateInfo{};
@@ -441,6 +470,7 @@ private:
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
+        // 创建logical dev需要queueCI信息
         createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
         createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
@@ -460,6 +490,7 @@ private:
             throw std::runtime_error("failed to create logical device!");
         }
 
+        // dev创建完了, 再从里面得到queue
         vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
         vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
     }
@@ -471,6 +502,7 @@ private:
         VkPresentModeKHR presentMode = chooseSwapPresentMode(swapChainSupport.presentModes);
         VkExtent2D extent = chooseSwapExtent(swapChainSupport.capabilities);
 
+        // 最小2张, 推荐3张.
         uint32_t imageCount = swapChainSupport.capabilities.minImageCount + 1;
         if (swapChainSupport.capabilities.maxImageCount > 0 && imageCount > swapChainSupport.capabilities.maxImageCount) {
             imageCount = swapChainSupport.capabilities.maxImageCount;
@@ -490,6 +522,7 @@ private:
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
         uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()};
 
+        // 这个有点意思, 一般gfx queue family同时支持present, 如果不是同一个QF, 还要指定sharingMode.
         if (indices.graphicsFamily != indices.presentFamily) {
             createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
             createInfo.queueFamilyIndexCount = 2;
@@ -515,6 +548,7 @@ private:
         swapChainExtent = extent;
     }
 
+    // 这里创建的imageView就是后面创建FB的attachments
     void createImageViews() {
         swapChainImageViews.resize(swapChainImages.size());
 
@@ -537,10 +571,13 @@ private:
         VkAttachmentDescription depthAttachment{};
         depthAttachment.format = findDepthFormat();
         depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        // 每个render pass开始时把深度清为clearValues中指定的值（本例为最远的1.0）。
         depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        // 深度只用于本帧的遮挡判断，render pass结束后无需保留其内容。
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        // 不关心进入render pass之前的旧内容；render pass会自动完成所需的layout转换。
         depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
@@ -549,6 +586,7 @@ private:
         colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
         VkAttachmentReference depthAttachmentRef{};
+        // attachment=1对应下面attachments数组中的depthAttachment。
         depthAttachmentRef.attachment = 1;
         depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
@@ -556,8 +594,11 @@ private:
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorAttachmentRef;
+        // 将深度附件接入subpass；只创建depth image并不会自动启用深度测试。
         subpass.pDepthStencilAttachment = &depthAttachmentRef;
 
+        // 让外部操作与本subpass中的color输出、early/late depth test之间建立内存依赖，
+        // 确保attachment在被本subpass读写前处于可安全访问的状态。
         VkSubpassDependency dependency{};
         dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
         dependency.dstSubpass = 0;
@@ -566,6 +607,7 @@ private:
         dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+        // 有color和depth
         std::array<VkAttachmentDescription, 2> attachments = {colorAttachment, depthAttachment};
         VkRenderPassCreateInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -581,7 +623,13 @@ private:
         }
     }
 
+    // 这个DS layout描述当前这个DS(descriptor set)一共有几个binding point, 每个point下有几个descriptor
+    // 注意这里并不是shader用的resource (ds), 而是表述ds的布局layout, 类似于metadata
+    // 虽然每个frame有自己的DS, 但是这个DS layout是一样的
     void createDescriptorSetLayout() {
+        // 有2个binding point, 一个ubo, 一个sampler.
+
+        // point 0是ubo, 只有一个descriptor
         VkDescriptorSetLayoutBinding uboLayoutBinding{};
         uboLayoutBinding.binding = 0;
         uboLayoutBinding.descriptorCount = 1;
@@ -589,6 +637,7 @@ private:
         uboLayoutBinding.pImmutableSamplers = nullptr;
         uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+        // point 1是sampler, 只有一个descriptor
         VkDescriptorSetLayoutBinding samplerLayoutBinding{};
         samplerLayoutBinding.binding = 1;
         samplerLayoutBinding.descriptorCount = 1;
@@ -666,8 +715,10 @@ private:
 
         VkPipelineDepthStencilStateCreateInfo depthStencil{};
         depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        // 开启深度比较，并让通过测试的片元把新深度写回depth attachment。
         depthStencil.depthTestEnable = VK_TRUE;
         depthStencil.depthWriteEnable = VK_TRUE;
+        // Vulkan的标准深度范围是[0, 1]；LESS表示深度值更小（更靠近相机）的片元通过。
         depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
         depthStencil.depthBoundsTestEnable = VK_FALSE;
         depthStencil.stencilTestEnable = VK_FALSE;
@@ -699,6 +750,7 @@ private:
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pipelineLayoutInfo.setLayoutCount = 1;
+        // pipeline layout里面要知道descriptor set layout.
         pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
 
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
@@ -733,6 +785,8 @@ private:
     void createFramebuffers() {
         swapChainFramebuffers.resize(swapChainImageViews.size());
 
+        // swap chain是3 buffer, 里面只有color, depth是app自己创建传进FB的attachment的
+        // 这里的顺序必须匹配render pass中的attachment索引：0是color，1是depth。
         for (size_t i = 0; i < swapChainImageViews.size(); i++) {
             std::array<VkImageView, 2> attachments = {
                 swapChainImageViews[i],
@@ -767,18 +821,26 @@ private:
         }
     }
 
+    // depth是gpu在走pipeline的时候生成的, 不是cpu传过去的, 没有像tex一样用staging buffer.
     void createDepthResources() {
         VkFormat depthFormat = findDepthFormat();
 
+        // depth image的尺寸必须与swapchain一致，所以recreateSwapChain()时也要重新创建。
+        // 本例不手动transition layout：render pass会依据attachment的initial/final layout自动转换。
+        // depth image是在gpu mem里面的DEVICE_LOCAL
         createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
         depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
     }
 
+    // 按候选顺序查找同时满足指定图像布局方式和功能要求的格式。
+    // candidates: 待检测的格式列表；tiling: 图像数据的排列方式；features: 必须支持的格式特性。
     VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features) {
         for (VkFormat format : candidates) {
             VkFormatProperties props;
+            // 不同物理设备对同一格式的支持可能不同，因此需要查询当前 GPU 的格式能力。
             vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
 
+            // features 是位掩码。按位与后仍等于 features，表示请求的所有特性均被支持。
             if (tiling == VK_IMAGE_TILING_LINEAR && (props.linearTilingFeatures & features) == features) {
                 return format;
             } else if (tiling == VK_IMAGE_TILING_OPTIMAL && (props.optimalTilingFeatures & features) == features) {
@@ -786,9 +848,12 @@ private:
             }
         }
 
+        // 所有候选格式都不符合要求，无法安全地创建对应图像资源。
         throw std::runtime_error("failed to find supported format!");
     }
 
+    // 按优先级选择深度格式：优先纯32位浮点深度，其次选择带8位stencil的格式。
+    // 返回的格式还必须支持optimal tiling，并能作为depth/stencil attachment使用。
     VkFormat findDepthFormat() {
         return findSupportedFormat(
         {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT},
@@ -810,6 +875,7 @@ private:
             throw std::runtime_error("failed to load texture image!");
         }
 
+        // tex是cpu传到gpu用的, 也是用staging buffer.
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
         createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
@@ -821,6 +887,7 @@ private:
 
         stbi_image_free(pixels);
 
+        // tex也是gpu mem, DEVICE_LOCAL
         createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
 
         transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -865,6 +932,8 @@ private:
         viewInfo.image = image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = format;
+        // subresourceRange 是用于选择mipmap levels和array layers.
+        // aspectMask 用于选择颜色附件还是深度附件.
         viewInfo.subresourceRange.aspectMask = aspectFlags;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -984,9 +1053,21 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
+    // Vulkan 中一个非常经典的 两阶段拷贝（two-stage copy） 模式
+    // 第一次 copy：从 vertices 拷贝到 CPU 可见的 staging buffer（memcpy）。
+    // 第二次 copy：从 staging buffer 通过 GPU command（vkCmdCopyBuffer）拷贝到真正的 vertex buffer（位于 GPU local memory）。
+    //     为什么第二次从staging buffer, 而不是从vertices copy?
+    //     GPU 无法直接访问 App 的 malloc/new 指针（即 CPU 普通内存），因为这些内存并不处于 GPU 可访问的设备映射区域中
+    //     是你用 std::vector、new 或 malloc 分配出来的一段用户空间的虚拟地址，是属于当前进程的 私有 CPU 内存空间。GPU 是无法看到这块内存的
+    //     所有 GPU 可访问的 buffer / memory，必须是你通过 Vulkan 显式创建 + 绑定的:
+    //     vkAllocateMemory(...) → 返回 VkDeviceMemory + vkBindBufferMemory(buffer, memory, offset);
+    // 在 OpenGL 中确实也发生了类似的“两次拷贝”行为，只不过这些操作被 OpenGL 驱动自动处理、隐藏了起来，开发者看不到而已
     void createVertexBuffer() {
         VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
 
+        // 创建一个临时的buf, HOST_VISIBLE | HOST_COHERENT, 用于拷贝把vertices copy到这里
+        // CPU 可以 vkMapMemory，用 memcpy 写入；
+        // 性能较低，不适合频繁用于渲染
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
         createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
@@ -996,14 +1077,18 @@ private:
             memcpy(data, vertices.data(), (size_t) bufferSize);
         vkUnmapMemory(device, stagingBufferMemory);
 
+        // vertexBuffer 是 DEVICE_LOCAL 的内存 —— 这是 GPU 本地的显存，性能最好，适合频繁渲染时使用
+        // CPU 无法直接访问 DEVICE_LOCAL 内存（不能 vkMapMemory）
         createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
 
+        // 然后用gpu cmd copy到VBO上.
         copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
 
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    // 和上面一样, 只是拷贝的是 indices.
     void createIndexBuffer() {
         VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
 
@@ -1024,6 +1109,14 @@ private:
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    // 做动态更新的小数据（如 uniform buffer），用 HOST_VISIBLE | HOST_COHERENT 的缓冲区直接写。
+    // 但像 VBO 这样的大块静态顶点数据，为了渲染效率，必须走这套 staging + device copy 机制。
+    // UBO 的典型特征：
+    //      数据量通常较小（几个 bytes 到几 KB）；
+    //      更新频率较高（如每帧更新 camera matrix、灯光参数等）；
+    //      GPU 使用的是只读方式；
+    //      不要求最高性能（不像 VBO 那种批量访问）；
+    //      写完后马上要被 GPU 用。
     void createUniformBuffers() {
         VkDeviceSize bufferSize = sizeof(UniformBufferObject);
 
@@ -1032,6 +1125,7 @@ private:
         uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            // HOST_VISIBLE_BIT | HOST_COHERENT 属性的 buffer, 写入后不需要显式 vkFlushMappedMemoryRanges(), GPU 可以立刻看到更新（coherent 的定义）
             createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
 
             vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
@@ -1040,8 +1134,10 @@ private:
 
     void createDescriptorPool() {
         std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        // 2 ubo decriptors, 每个frame一个
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // 2 sampler decriptors, 每个frame一个
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
@@ -1049,26 +1145,35 @@ private:
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolInfo.pPoolSizes = poolSizes.data();
+        // 这个pool总共可以分配 2 个 VkDescriptorSet（每帧一个）
         poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
+        // 只创建了一个descriptor pool, 这个pool里面有两种类型的 descriptor (uniform buffer 和 texture image)
+        // 里面有4个descriptors.
+        // 注意这个是descriptor的pool, 不是descriptor set的pool.
+        // 从pool里面分配descriptor后, 再组装成descriptor set 来使用它. 每个frame要用的就是DS: vkCmdBindDescriptorSets
         if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor pool!");
         }
     }
 
     void createDescriptorSets() {
+        // 两个一样的DS layout, 每个frame一个.
         std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        // 从descriptor pool里面分配 descriptor.
         allocInfo.descriptorPool = descriptorPool;
         allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
         allocInfo.pSetLayouts = layouts.data();
 
+        // 给descriptor set分配空间, descriptor是从pool里面分配的, 但是descriptor set还是要空间的.
         descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
         if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate descriptor sets!");
         }
 
+        // 每个frame一个descriptor set.
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             VkDescriptorBufferInfo bufferInfo{};
             bufferInfo.buffer = uniformBuffers[i];
@@ -1078,8 +1183,10 @@ private:
             VkDescriptorImageInfo imageInfo{};
             imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             imageInfo.imageView = textureImageView;
+            // 这个descriptor是用来做sampler的, 要知道sampler信息.
             imageInfo.sampler = textureSampler;
 
+            // 用两个VkWriteDescriptorSet创建(更新)两个DS, 即把资源写进descriptor set.
             std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
 
             descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1102,6 +1209,16 @@ private:
         }
     }
 
+    // VkMemoryPropertyFlags指定了是怎样的mem, 在CPU端访问还是在GPU端访问.
+    // DEVICE_LOCAL, gpu访问最高效, 就是gpu mem
+    // HOST_VISIBLE, 在cpu端的cpu mem, 映射给 GPU 用的系统内存，性能远低于 GPU mem, 两边都能看到
+    //     这并不意味着 GPU 一定能“马上”看到你写的数据！因为还没有保证 cache 的一致性。
+    //     必须手动调用: vkFlushMappedMemoryRanges(); 这是 Vulkan 的要求，用于保证：
+    //     CPU 写入的内容刷新到了内存中，确保 GPU 能看到最新数据（就像你 flush cache 一样）。
+    //     反过来，如果 GPU 写了数据，你要让 CPU 看到，也要调用: vkInvalidateMappedMemoryRanges();
+    //     单单HOST_VISIBLE就是还在写的这边的cache里面, 要手动flash到mem.
+    // HOST_VISIBLE | HOST_COHERENT, CPU 写入后，GPU 自动能看到更新（你不需要手动 flush）
+    // 用于更新数据，不需要显式 vkFlushMappedMemoryRanges
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1128,6 +1245,7 @@ private:
         vkBindBufferMemory(device, buffer, bufferMemory, 0);
     }
 
+    // 返回一个一次性的cmdbuf, 用于单次提交.
     VkCommandBuffer beginSingleTimeCommands() {
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1214,7 +1332,9 @@ private:
         renderPassInfo.renderArea.extent = swapChainExtent;
 
         std::array<VkClearValue, 2> clearValues{};
+        // clear value的顺序与render pass的attachment顺序一致：先color，再depth/stencil。
         clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        // depth=1.0表示最远处；stencil=0（本例没有开启stencil test）。
         clearValues[1].depthStencil = {1.0f, 0};
 
         renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
@@ -1256,6 +1376,7 @@ private:
     }
 
     void createSyncObjects() {
+        // 每一个frame都有这2个semaphore和一个fence.
         imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
         renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
         inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
@@ -1276,12 +1397,14 @@ private:
         }
     }
 
+    // runtime的时候每个frame更新.
     void updateUniformBuffer(uint32_t currentImage) {
         static auto startTime = std::chrono::high_resolution_clock::now();
 
         auto currentTime = std::chrono::high_resolution_clock::now();
         float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
+        // 每一帧都把其对应的MVP写到对应的ubo里面.
         UniformBufferObject ubo{};
         ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
         ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
@@ -1292,6 +1415,32 @@ private:
     }
 
     void drawFrame() {
+        // swapchain里面3个images, 但是MAX_FRAMES_IN_FLIGHT是2 (2个fence), 这里是资源的复用(资源没有image多).
+        // 只有两套资源，不能发frame 2，直到frame 0的 GPU 执行完毕
+        // frame 0: image 0 + wait(fence 0) + vkQueueSubmit(cmd, fence 0) // fence没用过不用等
+        // frame 1: image 1 + wait(fence 1) + vkQueueSubmit(cmd, fence 1) // fence没用过不用等
+        // frame 2: image 2 + wait(fence 0) + vkQueueSubmit(cmd, fence 0) // cpu等frame 0的fence 0, gpu做完了再画.
+        // frame 3: image 0 + wait(fence 1) + vkQueueSubmit(cmd, fence 1) // cpu等frame 1的fence 1, gpu做完了再画.
+        // frame 4: image 1 + wait(fence 0) + vkQueueSubmit(cmd, fence 0) // cpu等frame 2的fence 0, gpu做完了再画.
+        // frame 5: image 2 + wait(fence 1) + vkQueueSubmit(cmd, fence 1) // cpu等frame 3的fence 1, gpu做完了再画.
+        //
+        // 如果是3个images和3个fence:
+        // frame 0: image 0 + wait(fence 0) + vkQueueSubmit(cmd, fence 0) // fence没用过不用等
+        // frame 1: image 1 + wait(fence 1) + vkQueueSubmit(cmd, fence 1) // fence没用过不用等
+        // frame 2: image 2 + wait(fence 2) + vkQueueSubmit(cmd, fence 2) // fence没用过不用等
+        // frame 3: image 0 + wait(fence 0) + vkQueueSubmit(cmd, fence 0) // cpu等frame 0的fence, gpu做完了再画.
+        // frame 4: image 1 + wait(fence 1) + vkQueueSubmit(cmd, fence 1) // cpu等frame 1的fence, gpu做完了再画.
+        // frame 5: image 2 + wait(fence 2) + vkQueueSubmit(cmd, fence 2) // cpu等frame 2的fence, gpu做完了再画.
+        //
+        // 总结: swapchain image = minCount + 1 = 3, 是推荐的做法.
+        // 如果gpu太慢, cpu一直等gpu, 如果gpu太快, 等cpu, 这两种情况上面fence数量2/3没有太大区别.
+        // GPU 速度“刚好卡在 2 与 3 之间”, GPU 工作量中等偏上，不慢，但也不快。假如 CPU 提交太慢（因为等 fence），会造成 GPU 有短暂 idle。
+        // 而如果你把 MAX_FRAMES_IN_FLIGHT=3，CPU 不等 fence，能及时把第三帧提交给 GPU，让 GPU 连续运行，不 idle。perf会有小幅提升(e.g. 90% -> 98%/100%).
+        // 还有一个情况是gpu workload不稳定, 忽大忽小, 应该还是有提升的.
+        //
+        // 问题2, fence也是3, 和image一一对应, 还需要cpu等待吗?
+        // 要的, 否则cpu可能无限提交, driver就crash了.
+        // 可以在vkAcquireNextImageKHR后得到imageIndex, 等待特定的imageIndex[0, 1, 2], 而不是currentFrame[0, 1, 2], 返回的imageIndex不一定是012顺序.
         vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 
         uint32_t imageIndex;
@@ -1304,16 +1453,21 @@ private:
             throw std::runtime_error("failed to acquire swap chain image!");
         }
 
+        // 简单打印globalFrameId for debugging, 不考虑resize window或者error这些情况.
+        static uint64_t globalFrameId = 0;
+        std::cout << "drawFrame(), globalFrameId:" << globalFrameId << ", imageIndex(=image slot): " << imageIndex << ", currentFrame(=in flight slot): " << currentFrame << std::endl;
         updateUniformBuffer(currentFrame);
 
         vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
         vkResetCommandBuffer(commandBuffers[currentFrame], /*VkCommandBufferResetFlagBits*/ 0);
+        // 这里每帧都要record, 事实上可以在init的时候record完, 这里提交就可以.
         recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
+        // 当前要提交的cmd要等这个semaphore, 即只有这个swap chain image available了, 才能在上面画图.
         VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrame]};
         VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
         submitInfo.waitSemaphoreCount = 1;
@@ -1323,6 +1477,8 @@ private:
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
 
+        // 当前要提交的cmd被gpu执行了会signal这个semaphore, 告诉其他gpu cmd, 这个cmd已经执行完了,
+        // 你可以开始你的cmd了(如果你的cmd pending在我这里的话). 这个例子里面后面的QueuePresent在等这个semaphore.
         VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrame]};
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSemaphores;
@@ -1353,6 +1509,7 @@ private:
         }
 
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+        globalFrameId++;
     }
 
     VkShaderModule createShaderModule(const std::vector<char>& code) {
@@ -1411,8 +1568,10 @@ private:
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) {
         SwapChainSupportDetails details;
 
+        // 得到capabilities, 里面包含了swapchain最小/最多需要的image cnt等信息(e.g. double-buffer).
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface, &details.capabilities);
 
+        // 看surface支持的格式, 一般都是RGBA8
         uint32_t formatCount;
         vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount, nullptr);
 
@@ -1421,6 +1580,7 @@ private:
             vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount, details.formats.data());
         }
 
+        // 看present mode有哪些. FIFO: 就是一个queue数据结构, driver必须支持的. MODE_IMMEDIATE, 内部没有queue, 马上显示, 可能看见tearing. 还有其他mode
         uint32_t presentModeCount;
         vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &presentModeCount, nullptr);
 
@@ -1458,6 +1618,8 @@ private:
 
         std::set<std::string> requiredExtensions(deviceExtensions.begin(), deviceExtensions.end());
 
+        // 100多个, 不打印了, 用vulkaninfo看.
+
         for (const auto& extension : availableExtensions) {
             requiredExtensions.erase(extension.extensionName);
         }
@@ -1466,13 +1628,31 @@ private:
     }
 
     QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) {
+        // 我们要找既支持gfx的QF, 又支持present的QF, 找到了就return
+        // 注意这里可以是同一个QF,也可以是两个QF(看hw的支持情况).
         QueueFamilyIndices indices;
 
+        // 返回QF的个数, 每个QF在driver里面的index是固定的, 后面向driver查询特定的QF的时候直接传idx查询.
         uint32_t queueFamilyCount = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
 
         std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
         vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+
+        // 打印QF的所有信息, 学习, flags里面最重要的就是GRAPHICS_BIT/COMPUTE_BIT/TRANSFER_BIT
+        static bool printOnce = true;
+        for (size_t i = 0; i < queueFamilyCount && printOnce; i++) {
+            const auto& queueFamily = queueFamilies[i];
+            const auto& granularity = queueFamily.minImageTransferGranularity;
+
+            std::cout << "queueFamily[" << i << "]:\n"
+                      << "  queueFlags: 0x" << std::hex << queueFamily.queueFlags << std::dec << '\n'
+                      << "  queueCount: " << queueFamily.queueCount << '\n'
+                      << "  timestampValidBits: " << queueFamily.timestampValidBits << '\n'
+                      << "  minImageTransferGranularity: ["
+                      << granularity.width << ", " << granularity.height << ", " << granularity.depth << "]\n";
+        }
+        printOnce = false;
 
         int i = 0;
         for (const auto& queueFamily : queueFamilies) {
@@ -1500,10 +1680,12 @@ private:
     std::vector<const char*> getRequiredExtensions() {
         uint32_t glfwExtensionCount = 0;
         const char** glfwExtensions;
+        // 获取glfw需要的instance extensions, 这些extensions是Vulkan的instance必须支持的, glfw要使用这些extensions来创建instance.
         glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
         std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
 
+        // 如果开启了validation layers, 则需要添加VK_EXT_DEBUG_UTILS_EXTENSION_NAME, 这个extension是Vulkan的instance必须支持的, 用于调试.
         if (enableValidationLayers) {
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         }
@@ -1517,6 +1699,17 @@ private:
 
         std::vector<VkLayerProperties> availableLayers(layerCount);
         vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+
+        // 打印所有的instance layers
+        std::cout << "instance layer count: " << layerCount << std::endl;
+        for (const auto& layerProperties : availableLayers) {
+            std::cout << "layer: " << layerProperties.layerName << '\n'
+                      << "  specVersion: " << VK_API_VERSION_MAJOR(layerProperties.specVersion) << '.'
+                      << VK_API_VERSION_MINOR(layerProperties.specVersion) << '.'
+                      << VK_API_VERSION_PATCH(layerProperties.specVersion) << '\n'
+                      << "  implementationVersion: " << layerProperties.implementationVersion << '\n'
+                      << "  description: " << layerProperties.description << "\n\n";
+        }
 
         for (const char* layerName : validationLayers) {
             bool layerFound = false;

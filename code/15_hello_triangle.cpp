@@ -192,11 +192,13 @@ private:
         createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         createInfo.ppEnabledExtensionNames = extensions.data();
 
+        // 如果开启了validation layers, 则需要添加validation layers.
         VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
         if (enableValidationLayers) {
             createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
             createInfo.ppEnabledLayerNames = validationLayers.data();
 
+            // 设置debug messenger的回调函数.
             populateDebugMessengerCreateInfo(debugCreateInfo);
             createInfo.pNext = (VkDebugUtilsMessengerCreateInfoEXT*) &debugCreateInfo;
         } else {
@@ -264,6 +266,7 @@ private:
         std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
         std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsFamily.value(), indices.presentFamily.value()};
 
+        // 创建的时候指定创建q的个数, 还有从哪个queueFamilyIndex里面创建
         float queuePriority = 1.0f;
         for (uint32_t queueFamily : uniqueQueueFamilies) {
             VkDeviceQueueCreateInfo queueCreateInfo{};
@@ -279,6 +282,7 @@ private:
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
+        // 创建logical dev需要queueCI信息
         createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
         createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
@@ -298,6 +302,7 @@ private:
             throw std::runtime_error("failed to create logical device!");
         }
 
+        // dev创建完了, 再从里面得到queue
         vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
         vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
     }
@@ -309,6 +314,7 @@ private:
         VkPresentModeKHR presentMode = chooseSwapPresentMode(swapChainSupport.presentModes);
         VkExtent2D extent = chooseSwapExtent(swapChainSupport.capabilities);
 
+        // 最小2张, 推荐3张.
         uint32_t imageCount = swapChainSupport.capabilities.minImageCount + 1;
         if (swapChainSupport.capabilities.maxImageCount > 0 && imageCount > swapChainSupport.capabilities.maxImageCount) {
             imageCount = swapChainSupport.capabilities.maxImageCount;
@@ -328,6 +334,7 @@ private:
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
         uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()};
 
+        // 这个有点意思, 一般gfx queue family同时支持present, 如果不是同一个QF, 还要指定sharingMode.
         if (indices.graphicsFamily != indices.presentFamily) {
             createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
             createInfo.queueFamilyIndexCount = 2;
@@ -355,6 +362,7 @@ private:
         swapChainExtent = extent;
     }
 
+    // 这里创建的imageView就是后面创建FB的attachments
     void createImageViews() {
         swapChainImageViews.resize(swapChainImages.size());
 
@@ -641,6 +649,8 @@ private:
     }
 
     void drawFrame() {
+        // 所有frame(swapchain里面3个images)共用一个fence, cpu用来等gpu, cmd里面就画一个三角形, 每次submit cmd到queue都要带一个fence,
+        // 然后cpu在每次drawFrame开始的时候等这个fence, 即上一帧gpu做完了在画. (效率不高)
         vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &inFlightFence);
 
@@ -653,6 +663,8 @@ private:
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
+        // vkQueueSubmit要2个semaphore,
+        // 1, 什么时候开始? 即当前要提交的cmd要等这个semaphore, 即只有这个swap chain image available了, 才能在上面画图.
         VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};
         VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
         submitInfo.waitSemaphoreCount = 1;
@@ -662,6 +674,9 @@ private:
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
 
+        // 2, 什么时候结束?
+        // 当前要提交的cmd被gpu执行了会signal这个semaphore, 告诉其他gpu cmd, 这个cmd已经执行完了,
+        // 你可以开始你的cmd了(如果你的cmd pending在我这里的话). 这个例子里面后面的QueuePresent在等这个semaphore.
         VkSemaphore signalSemaphores[] = {renderFinishedSemaphore};
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSemaphores;
@@ -683,6 +698,9 @@ private:
         presentInfo.pImageIndices = &imageIndex;
 
         vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        // 加上这个validation layer不会有抱怨, 这里不用太纠结同步的事情, 放到27
+        vkQueueWaitIdle(presentQueue);
     }
 
     VkShaderModule createShaderModule(const std::vector<char>& code) {
@@ -741,8 +759,10 @@ private:
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) {
         SwapChainSupportDetails details;
 
+        // 得到capabilities, 里面包含了swapchain最小/最多需要的image cnt等信息(e.g. double-buffer).
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface, &details.capabilities);
 
+        // 看surface支持的格式, 一般都是RGBA8
         uint32_t formatCount;
         vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount, nullptr);
 
@@ -751,6 +771,7 @@ private:
             vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount, details.formats.data());
         }
 
+        // 看present mode有哪些. FIFO: 就是一个queue数据结构, driver必须支持的. MODE_IMMEDIATE, 内部没有queue, 马上显示, 可能看见tearing. 还有其他mode
         uint32_t presentModeCount;
         vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &presentModeCount, nullptr);
 
@@ -785,6 +806,8 @@ private:
 
         std::set<std::string> requiredExtensions(deviceExtensions.begin(), deviceExtensions.end());
 
+        // 100多个, 不打印了, 用vulkaninfo看.
+
         for (const auto& extension : availableExtensions) {
             requiredExtensions.erase(extension.extensionName);
         }
@@ -793,13 +816,31 @@ private:
     }
 
     QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) {
+        // 我们要找既支持gfx的QF, 又支持present的QF, 找到了就return
+        // 注意这里可以是同一个QF,也可以是两个QF(看hw的支持情况).
         QueueFamilyIndices indices;
 
+        // 返回QF的个数, 每个QF在driver里面的index是固定的, 后面向driver查询特定的QF的时候直接传idx查询.
         uint32_t queueFamilyCount = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
 
         std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
         vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+
+        // 打印QF的所有信息, 学习, flags里面最重要的就是GRAPHICS_BIT/COMPUTE_BIT/TRANSFER_BIT
+        static bool printOnce = true;
+        for (size_t i = 0; i < queueFamilyCount && printOnce; i++) {
+            const auto& queueFamily = queueFamilies[i];
+            const auto& granularity = queueFamily.minImageTransferGranularity;
+
+            std::cout << "queueFamily[" << i << "]:\n"
+                      << "  queueFlags: 0x" << std::hex << queueFamily.queueFlags << std::dec << '\n'
+                      << "  queueCount: " << queueFamily.queueCount << '\n'
+                      << "  timestampValidBits: " << queueFamily.timestampValidBits << '\n'
+                      << "  minImageTransferGranularity: ["
+                      << granularity.width << ", " << granularity.height << ", " << granularity.depth << "]\n";
+        }
+        printOnce = false;
 
         int i = 0;
         for (const auto& queueFamily : queueFamilies) {
@@ -827,10 +868,12 @@ private:
     std::vector<const char*> getRequiredExtensions() {
         uint32_t glfwExtensionCount = 0;
         const char** glfwExtensions;
+        // 获取glfw需要的instance extensions, 这些extensions是Vulkan的instance必须支持的, glfw要使用这些extensions来创建instance.
         glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
         std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
 
+        // 如果开启了validation layers, 则需要添加VK_EXT_DEBUG_UTILS_EXTENSION_NAME, 这个extension是Vulkan的instance必须支持的, 用于调试.
         if (enableValidationLayers) {
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         }
@@ -844,6 +887,17 @@ private:
 
         std::vector<VkLayerProperties> availableLayers(layerCount);
         vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+
+        // 打印所有的instance layers
+        std::cout << "instance layer count: " << layerCount << std::endl;
+        for (const auto& layerProperties : availableLayers) {
+            std::cout << "layer: " << layerProperties.layerName << '\n'
+                      << "  specVersion: " << VK_API_VERSION_MAJOR(layerProperties.specVersion) << '.'
+                      << VK_API_VERSION_MINOR(layerProperties.specVersion) << '.'
+                      << VK_API_VERSION_PATCH(layerProperties.specVersion) << '\n'
+                      << "  implementationVersion: " << layerProperties.implementationVersion << '\n'
+                      << "  description: " << layerProperties.description << "\n\n";
+        }
 
         for (const char* layerName : validationLayers) {
             bool layerFound = false;

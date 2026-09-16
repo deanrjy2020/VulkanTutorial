@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug",
+      "type": "cppdbg",
+      "request": "launch",
+      //"program": "${workspaceFolder}/build/15_hello_triangle/15_hello_triangle.exe",
+      "program": "${workspaceFolder}/build/27_depth_buffering/27_depth_buffering.exe",
+      "args": [],
+      //"cwd": "${workspaceFolder}/build/15_hello_triangle",
+      "cwd": "${workspaceFolder}/build/27_depth_buffering",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/mingw64/bin/gdb.exe",
+      "externalConsole": true
+    }
+  ]
+}

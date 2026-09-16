@@ -3,6 +3,10 @@ ads.txt
 
 **/_out/*
 **/.vscode/*
+!/.vscode/
+!/.vscode/extensions.json
+!/.vscode/launch.json
+!/.vscode/settings.json
 .DS_Store
 build_ebook.log
 temp_ebook.md
